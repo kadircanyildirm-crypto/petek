@@ -1,0 +1,14 @@
+[package]
+name = "petek"
+description = "An archetype-based Entity Component System"
+readme = "../../README.md"
+keywords = ["ecs", "gamedev", "entity", "component", "system"]
+categories = ["game-development", "data-structures"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
