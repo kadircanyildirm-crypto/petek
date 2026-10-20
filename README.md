@@ -11,7 +11,7 @@ so that systems can iterate over them quickly.
 ## Roadmap
 
 - [x] Generational entity ids
-- [ ] Type-erased column storage
+- [x] Type-erased column storage
 - [ ] Archetypes and `World`
 - [ ] Queries with filters
 - [ ] Resources, commands and change detection
