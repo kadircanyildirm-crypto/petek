@@ -10,7 +10,7 @@ so that systems can iterate over them quickly.
 
 ## Roadmap
 
-- [ ] Generational entity ids
+- [x] Generational entity ids
 - [ ] Type-erased column storage
 - [ ] Archetypes and `World`
 - [ ] Queries with filters
