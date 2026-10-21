@@ -1,6 +1,40 @@
 //! An archetype-based Entity Component System.
 //!
-//! **Work in progress:** the public API is not usable yet.
+//! Entities are lightweight ids, and components are plain Rust types attached
+//! to them. Entities with the same set of components are stored together in
+//! an *archetype*, with one contiguous column per component.
+//!
+//! ```
+//! use petek::{Component, World};
+//!
+//! #[derive(Debug, PartialEq)]
+//! struct Position {
+//!     x: f32,
+//!     y: f32,
+//! }
+//! impl Component for Position {}
+//!
+//! #[derive(Debug, PartialEq)]
+//! struct Velocity {
+//!     x: f32,
+//!     y: f32,
+//! }
+//! impl Component for Velocity {}
+//!
+//! let mut world = World::new();
+//! let ball = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 2.0 }));
+//!
+//! // Components can be added and removed at any time.
+//! let velocity = world.remove::<Velocity>(ball).unwrap();
+//! let position = world.get_mut::<Position>(ball).unwrap();
+//! position.x += velocity.x;
+//! position.y += velocity.y;
+//!
+//! assert_eq!(world.get::<Position>(ball), Some(&Position { x: 1.0, y: 2.0 }));
+//! assert_eq!(world.get::<Velocity>(ball), None);
+//! ```
+//!
+//! **Work in progress:** queries and systems are not implemented yet.
 
 mod archetype;
 mod bundle;

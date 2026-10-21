@@ -8,11 +8,44 @@ An archetype-based Entity Component System (ECS) for Rust.
 components live side by side in the same cell (an *archetype*), packed densely
 so that systems can iterate over them quickly.
 
+## Example
+
+```rust
+use petek::{Component, World};
+
+struct Position { x: f32, y: f32 }
+impl Component for Position {}
+
+struct Velocity { x: f32, y: f32 }
+impl Component for Velocity {}
+
+let mut world = World::new();
+let ball = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 2.0 }));
+
+let velocity = world.remove::<Velocity>(ball).unwrap();
+let position = world.get_mut::<Position>(ball).unwrap();
+position.x += velocity.x;
+position.y += velocity.y;
+```
+
+## Soundness
+
+`petek` uses `unsafe` code for its type-erased storage, so it is held to a
+strict standard:
+
+- every `unsafe` block carries a `SAFETY` comment (enforced by Clippy);
+- the whole test suite runs under [Miri] with strict provenance in CI;
+- structural changes run no user code until the world is consistent again,
+  so a panicking component destructor cannot cause a double drop or leave an
+  entity half-moved.
+
+[Miri]: https://github.com/rust-lang/miri
+
 ## Roadmap
 
 - [x] Generational entity ids
 - [x] Type-erased column storage
-- [ ] Archetypes and `World`
+- [x] Archetypes and `World`
 - [ ] Queries with filters
 - [ ] Resources, commands and change detection
 - [ ] Systems and a parallel scheduler
