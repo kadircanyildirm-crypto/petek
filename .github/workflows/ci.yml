@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -19,39 +26,56 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-targets
       - run: cargo test --workspace --doc
+      # Optimized, without debug assertions.
+      - run: cargo test --workspace --release
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
-      - run: cargo doc --workspace --no-deps
+      - run: cargo doc --workspace --no-deps --document-private-items
 
+  # The unsafe code is checked under both of Rust's candidate aliasing models,
+  # and on 32-bit and big-endian targets.
   miri:
-    name: Miri
+    name: Miri (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stacked borrows
+            target: x86_64-unknown-linux-gnu
+          - name: tree borrows
+            target: x86_64-unknown-linux-gnu
+            flags: -Zmiri-tree-borrows
+          - name: 32-bit
+            target: i686-unknown-linux-gnu
+          - name: big-endian
+            target: s390x-unknown-linux-gnu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: miri
-      - run: cargo miri test --workspace
+          components: miri, rust-src
+      - run: cargo miri test --workspace --target ${{ matrix.target }}
         env:
-          MIRIFLAGS: -Zmiri-strict-provenance
+          MIRIFLAGS: -Zmiri-strict-provenance ${{ matrix.flags }}
 
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo test --workspace --all-targets
