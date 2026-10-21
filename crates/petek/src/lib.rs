@@ -6,8 +6,6 @@ mod archetype;
 mod bundle;
 mod component;
 mod entity;
-// Until `World::insert` lands, parts of the storage are only used by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 mod storage;
 mod world;
 

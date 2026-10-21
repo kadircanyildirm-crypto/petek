@@ -84,6 +84,7 @@ impl World {
             archetype.push_bundle(bundle, &bundle_info.component_ids);
             archetype.push_entity(entity);
         }
+        archetype.debug_assert_consistent();
         entity
     }
 
@@ -100,7 +101,121 @@ impl World {
         // SAFETY: as above. Destructors run only now that the bookkeeping is
         // consistent again.
         unsafe { archetype.drop_from_columns(row, |_| true) };
+        archetype.debug_assert_consistent();
         Ok(())
+    }
+
+    /// Adds the components in `bundle` to `entity`. Components the entity
+    /// already has are overwritten, and their old values dropped.
+    ///
+    /// # Panics
+    ///
+    /// If the bundle contains the same component more than once.
+    pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), NoSuchEntity> {
+        let location = self.entities.get(entity).ok_or(NoSuchEntity(entity))?;
+        let bundle_id = self.bundles.register::<B>(&mut self.components);
+        let bundle_info = self.bundles.info(bundle_id);
+        let src_id = location.archetype;
+        let dst_id = self.archetypes.insert_target(
+            src_id,
+            bundle_id,
+            &bundle_info.sorted_ids,
+            &self.components,
+        );
+        let src_row = location.row as usize;
+
+        if src_id == dst_id {
+            // The entity already has all of the bundle's components.
+            let archetype = self.archetypes.get_mut(src_id);
+            // SAFETY: an alive entity's row is in bounds, and its archetype has
+            // a column for every component of the bundle.
+            unsafe { archetype.replace_bundle(src_row, bundle, &bundle_info.component_ids) };
+            return Ok(());
+        }
+
+        let (src, dst) = self.archetypes.get_two_mut(src_id, dst_id);
+        let dst_row = u32::try_from(dst.len()).expect("too many entities");
+        // First restructure, which runs no user code...
+        // SAFETY: the row is in bounds, and `dst` has every component of `src`
+        // plus the bundle's. The bundle's components stay behind in `src`, and
+        // the bundle itself fills them in on the new row.
+        let moved = unsafe {
+            let moved = src.move_row_to(src_row, dst, &bundle_info.sorted_ids);
+            dst.push_bundle(bundle, &bundle_info.component_ids);
+            moved
+        };
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype: dst_id,
+                row: dst_row,
+            },
+        );
+        if let Some(moved) = moved {
+            self.entities.set_location(moved, location);
+        }
+        // ...then, with everything consistent, drop the values the bundle
+        // replaced.
+        // SAFETY: `src_row` is still in the columns that were skipped.
+        unsafe {
+            src.drop_from_columns(src_row, |id| {
+                bundle_info.sorted_ids.binary_search(&id).is_ok()
+            });
+        }
+        src.debug_assert_consistent();
+        dst.debug_assert_consistent();
+        Ok(())
+    }
+
+    /// Removes the components in `B` from `entity` and returns them.
+    ///
+    /// Returns `None`, leaving the entity untouched, if the entity is not alive
+    /// or lacks any of the components.
+    ///
+    /// # Panics
+    ///
+    /// If the bundle contains the same component more than once.
+    pub fn remove<B: Bundle>(&mut self, entity: Entity) -> Option<B> {
+        let location = self.entities.get(entity)?;
+        let bundle_id = self.bundles.register::<B>(&mut self.components);
+        let bundle_info = self.bundles.info(bundle_id);
+        let src_id = location.archetype;
+        let dst_id = self.archetypes.remove_target(
+            src_id,
+            bundle_id,
+            &bundle_info.sorted_ids,
+            &self.components,
+        )?;
+        let src_row = location.row as usize;
+
+        if src_id == dst_id {
+            // Only removing the empty bundle leaves the archetype unchanged.
+            // SAFETY: `B` has no components, so the closure is never called.
+            return Some(unsafe { B::from_components(&mut || unreachable!()) });
+        }
+
+        // No user code runs below, so no step needs to come before another.
+        let (src, dst) = self.archetypes.get_two_mut(src_id, dst_id);
+        let dst_row = u32::try_from(dst.len()).expect("too many entities");
+        // SAFETY: the row is in bounds, and `dst` has exactly the components of
+        // `src` that are not in the bundle, so the new row is complete.
+        let moved = unsafe { src.move_row_to(src_row, dst, &bundle_info.sorted_ids) };
+        // SAFETY: `src_row` is still in the columns of the bundle's
+        // components, which `src` has.
+        let bundle = unsafe { src.take_bundle(src_row, &bundle_info.component_ids) };
+        self.entities.set_location(
+            entity,
+            EntityLocation {
+                archetype: dst_id,
+                row: dst_row,
+            },
+        );
+        if let Some(moved) = moved {
+            self.entities.set_location(moved, location);
+        }
+        src.debug_assert_consistent();
+        dst.debug_assert_consistent();
+        Some(bundle)
     }
 
     /// Returns a reference to `entity`'s `T` component, if it is alive and has
@@ -172,15 +287,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct Pos(i32);
     impl Component for Pos {}
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct Vel(i32);
     impl Component for Vel {}
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     struct Name(String);
     impl Component for Name {}
 
@@ -195,6 +310,20 @@ mod tests {
     impl Drop for Tracked {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Panics when dropped while armed.
+    struct Bomb {
+        armed: bool,
+    }
+    impl Component for Bomb {}
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            if self.armed {
+                panic!("boom");
+            }
         }
     }
 
@@ -294,18 +423,6 @@ mod tests {
     fn panicking_destructor_during_despawn_leaves_the_world_consistent() {
         static COUNTED_DROPS: AtomicUsize = AtomicUsize::new(0);
 
-        struct Bomb {
-            armed: bool,
-        }
-        impl Component for Bomb {}
-        impl Drop for Bomb {
-            fn drop(&mut self) {
-                if self.armed {
-                    panic!("boom");
-                }
-            }
-        }
-
         struct Counted;
         impl Component for Counted {}
         impl Drop for Counted {
@@ -329,5 +446,218 @@ mod tests {
         assert_eq!(COUNTED_DROPS.load(Ordering::Relaxed), 0);
         drop(world);
         assert_eq!(COUNTED_DROPS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn insert_adds_components() {
+        let mut world = World::new();
+        let a = world.spawn(Pos(1));
+        let b = world.spawn(Pos(2));
+
+        assert_eq!(world.insert(a, (Vel(10), Marker)), Ok(()));
+        assert_eq!(world.get::<Pos>(a), Some(&Pos(1)));
+        assert_eq!(world.get::<Vel>(a), Some(&Vel(10)));
+        assert_eq!(world.get::<Marker>(a), Some(&Marker));
+        // `b` moved into the row `a` left behind.
+        assert_eq!(world.get::<Pos>(b), Some(&Pos(2)));
+        assert_eq!(world.get::<Vel>(b), None);
+    }
+
+    #[test]
+    fn insert_overwrites_existing_components() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let entity = world.spawn((Pos(1), Tracked(drops.clone())));
+
+        // Every component already exists: overwritten in place.
+        world.insert(entity, Tracked(drops.clone())).unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        // Some exist and some don't: the entity moves, and the old `Tracked`
+        // is dropped while `Pos` is carried over.
+        world
+            .insert(entity, (Tracked(drops.clone()), Vel(5)))
+            .unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(world.get::<Pos>(entity), Some(&Pos(1)));
+        assert_eq!(world.get::<Vel>(entity), Some(&Vel(5)));
+
+        drop(world);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn insert_into_a_dead_entity_drops_the_bundle() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut world = World::new();
+        let entity = world.spawn(());
+        world.despawn(entity).unwrap();
+
+        let result = world.insert(entity, Tracked(drops.clone()));
+        assert_eq!(result, Err(NoSuchEntity(entity)));
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn remove_returns_the_components() {
+        let mut world = World::new();
+        let a = world.spawn((Pos(1), Vel(2), Name("a".into())));
+        let b = world.spawn((Pos(3), Vel(4), Name("b".into())));
+
+        let removed = world.remove::<(Name, Pos)>(a);
+        assert_eq!(removed, Some((Name("a".into()), Pos(1))));
+        assert_eq!(world.get::<Pos>(a), None);
+        assert_eq!(world.get::<Name>(a), None);
+        assert_eq!(world.get::<Vel>(a), Some(&Vel(2)));
+        assert_eq!(world.get::<Name>(b), Some(&Name("b".into())));
+    }
+
+    #[test]
+    fn remove_fails_without_changing_anything() {
+        let mut world = World::new();
+        let entity = world.spawn((Pos(1), Vel(2)));
+
+        assert_eq!(world.remove::<(Pos, Name)>(entity), None);
+        assert_eq!(world.get::<Pos>(entity), Some(&Pos(1)));
+        assert_eq!(world.remove::<()>(entity), Some(()));
+
+        world.despawn(entity).unwrap();
+        assert_eq!(world.remove::<Pos>(entity), None);
+    }
+
+    #[test]
+    fn archetypes_are_reused() {
+        let mut world = World::new();
+        let entity = world.spawn(Pos(0));
+        world.insert(entity, Vel(0)).unwrap();
+        world.remove::<Vel>(entity).unwrap();
+        let archetypes = world.archetypes.len();
+
+        for _ in 0..10 {
+            world.insert(entity, Vel(0)).unwrap();
+            world.remove::<Vel>(entity).unwrap();
+        }
+        world.spawn((Vel(1), Pos(1)));
+        assert_eq!(world.archetypes.len(), archetypes);
+    }
+
+    #[test]
+    fn panicking_destructor_during_insert_leaves_the_world_consistent() {
+        let mut world = World::new();
+        let a = world.spawn((Pos(1), Bomb { armed: true }));
+        let b = world.spawn((Pos(2), Bomb { armed: false }));
+
+        // The armed bomb is replaced while the entity moves to a new
+        // archetype, so it goes off after the move is complete.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            world.insert(a, (Bomb { armed: false }, Vel(1))).unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(world.get::<Pos>(a), Some(&Pos(1)));
+        assert_eq!(world.get::<Vel>(a), Some(&Vel(1)));
+        assert_eq!(world.get::<Bomb>(a).map(|bomb| bomb.armed), Some(false));
+        assert_eq!(world.get::<Pos>(b), Some(&Pos(2)));
+
+        // The same, but overwriting in place.
+        world.insert(b, Bomb { armed: true }).unwrap();
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            world.insert(b, Bomb { armed: false }).unwrap();
+        }));
+        assert!(result.is_err());
+        assert_eq!(world.get::<Bomb>(b).map(|bomb| bomb.armed), Some(false));
+        assert_eq!(world.get::<Pos>(b), Some(&Pos(2)));
+    }
+
+    /// Applies a deterministic pseudo-random mix of operations and checks the
+    /// world against a straightforward model after each batch.
+    #[test]
+    fn matches_a_model_under_random_operations() {
+        #[derive(Default)]
+        struct Expected {
+            pos: Option<Pos>,
+            vel: Option<Vel>,
+            name: Option<Name>,
+        }
+
+        fn check(world: &World, alive: &[(Entity, Expected)], dead: &[Entity]) {
+            assert_eq!(world.len() as usize, alive.len());
+            for (entity, expected) in alive {
+                assert_eq!(world.get::<Pos>(*entity), expected.pos.as_ref());
+                assert_eq!(world.get::<Vel>(*entity), expected.vel.as_ref());
+                assert_eq!(world.get::<Name>(*entity), expected.name.as_ref());
+            }
+            assert!(dead.iter().all(|&entity| !world.contains(entity)));
+        }
+
+        // A tiny xorshift generator keeps the test reproducible without a
+        // dependency.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+
+        let mut world = World::new();
+        let mut alive: Vec<(Entity, Expected)> = Vec::new();
+        let mut dead = Vec::new();
+        let steps = if cfg!(miri) { 400 } else { 10_000 };
+        for value in 0..steps {
+            let target = (!alive.is_empty()).then(|| random(alive.len()));
+            match (random(7), target) {
+                (0, _) | (_, None) => {
+                    let entity = world.spawn((Pos(value), Vel(-value)));
+                    let expected = Expected {
+                        pos: Some(Pos(value)),
+                        vel: Some(Vel(-value)),
+                        name: None,
+                    };
+                    alive.push((entity, expected));
+                }
+                (1, _) => {
+                    let entity = world.spawn(Name(value.to_string()));
+                    let expected = Expected {
+                        name: Some(Name(value.to_string())),
+                        ..Expected::default()
+                    };
+                    alive.push((entity, expected));
+                }
+                (2, Some(i)) => {
+                    let (entity, _) = alive.swap_remove(i);
+                    world.despawn(entity).unwrap();
+                    dead.push(entity);
+                }
+                (3, Some(i)) => {
+                    let (entity, expected) = &mut alive[i];
+                    world.insert(*entity, Name(value.to_string())).unwrap();
+                    expected.name = Some(Name(value.to_string()));
+                }
+                (4, Some(i)) => {
+                    let (entity, expected) = &mut alive[i];
+                    world.insert(*entity, (Vel(value), Pos(value))).unwrap();
+                    expected.vel = Some(Vel(value));
+                    expected.pos = Some(Pos(value));
+                }
+                (5, Some(i)) => {
+                    let (entity, expected) = &mut alive[i];
+                    assert_eq!(world.remove::<Pos>(*entity), expected.pos.take());
+                }
+                (_, Some(i)) => {
+                    let (entity, expected) = &mut alive[i];
+                    let removed = world.remove::<(Name, Vel)>(*entity);
+                    if expected.name.is_some() && expected.vel.is_some() {
+                        let expected = (expected.name.take(), expected.vel.take());
+                        assert_eq!(removed.map(|(n, v)| (Some(n), Some(v))), Some(expected));
+                    } else {
+                        assert_eq!(removed, None);
+                    }
+                }
+            }
+            if value % 100 == 0 {
+                check(&world, &alive, &dead);
+            }
+        }
+        check(&world, &alive, &dead);
     }
 }

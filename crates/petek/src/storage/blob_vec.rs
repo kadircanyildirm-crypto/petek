@@ -62,10 +62,6 @@ impl BlobVec {
         self.len
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Makes room for at least `additional` more items.
     pub(crate) fn reserve(&mut self, additional: usize) {
         let required = self.len.checked_add(additional).expect("capacity overflow");
@@ -418,7 +414,7 @@ mod tests {
         }
         vec.0.clear();
         assert_eq!(drops.get(), 5);
-        assert!(vec.0.is_empty());
+        assert_eq!(vec.len(), 0);
 
         vec.push(Tracked::new(5, &drops));
         assert_eq!(vec.get(0).id, 5);
