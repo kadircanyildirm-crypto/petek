@@ -2,16 +2,16 @@
 //!
 //! **Work in progress:** the public API is not usable yet.
 
-// Until `World` lands, these internals are only used by their unit tests.
-#[cfg_attr(not(test), allow(dead_code))]
+mod archetype;
 mod bundle;
-#[cfg_attr(not(test), allow(dead_code))]
 mod component;
-#[cfg_attr(not(test), allow(dead_code))]
 mod entity;
+// Until `World::insert` lands, parts of the storage are only used by tests.
 #[cfg_attr(not(test), allow(dead_code))]
 mod storage;
+mod world;
 
 pub use bundle::Bundle;
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
+pub use world::{NoSuchEntity, World};

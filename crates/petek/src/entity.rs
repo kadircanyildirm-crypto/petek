@@ -3,6 +3,8 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
+use crate::archetype::ArchetypeId;
+
 /// A lightweight handle to an entity.
 ///
 /// An `Entity` is a slot index paired with a *generation*. Indices are
@@ -57,7 +59,15 @@ impl fmt::Debug for Entity {
     }
 }
 
-/// Allocates entity handles and tracks which of them are alive.
+/// Where an entity's components are stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct EntityLocation {
+    pub(crate) archetype: ArchetypeId,
+    /// The entity's row in the archetype.
+    pub(crate) row: u32,
+}
+
+/// Allocates entity handles and tracks where each alive entity is stored.
 #[derive(Default)]
 pub(crate) struct Entities {
     meta: Vec<EntityMeta>,
@@ -72,23 +82,25 @@ struct EntityMeta {
     /// The generation of the entity that lives, or will next live, in this
     /// slot.
     generation: NonZeroU32,
-    alive: bool,
+    /// `None` while the slot is free.
+    location: Option<EntityLocation>,
 }
 
 impl Entities {
-    /// Allocates a new entity, reusing a free slot if there is one.
-    pub(crate) fn alloc(&mut self) -> Entity {
+    /// Allocates a new entity stored at `location`, reusing a free slot if
+    /// there is one.
+    pub(crate) fn alloc(&mut self, location: EntityLocation) -> Entity {
         let entity = match self.free.pop() {
             Some(index) => {
                 let meta = &mut self.meta[index as usize];
-                meta.alive = true;
+                meta.location = Some(location);
                 Entity::new(index, meta.generation)
             }
             None => {
                 let index = u32::try_from(self.meta.len()).expect("too many entities");
                 self.meta.push(EntityMeta {
                     generation: NonZeroU32::MIN,
-                    alive: true,
+                    location: Some(location),
                 });
                 Entity::new(index, NonZeroU32::MIN)
             }
@@ -97,15 +109,14 @@ impl Entities {
         entity
     }
 
-    /// Frees `entity` so its slot can be reused.
+    /// Frees `entity` so its slot can be reused, returning where it was
+    /// stored.
     ///
-    /// Returns `false`, and does nothing, if `entity` was not alive.
-    pub(crate) fn free(&mut self, entity: Entity) -> bool {
-        if !self.contains(entity) {
-            return false;
-        }
+    /// Returns `None`, and does nothing, if `entity` was not alive.
+    pub(crate) fn free(&mut self, entity: Entity) -> Option<EntityLocation> {
+        let location = self.get(entity)?;
         let meta = &mut self.meta[entity.index as usize];
-        meta.alive = false;
+        meta.location = None;
         self.len -= 1;
         // A slot whose generation would overflow is retired for good rather
         // than wrapped around, so a stale handle can never become valid again.
@@ -113,14 +124,28 @@ impl Entities {
             meta.generation = next;
             self.free.push(entity.index);
         }
-        true
+        Some(location)
+    }
+
+    /// Returns where `entity` is stored, or `None` if it is not alive.
+    pub(crate) fn get(&self, entity: Entity) -> Option<EntityLocation> {
+        let meta = self.meta.get(entity.index as usize)?;
+        if meta.generation == entity.generation {
+            meta.location
+        } else {
+            None
+        }
     }
 
     /// Returns `true` if `entity` is alive.
     pub(crate) fn contains(&self, entity: Entity) -> bool {
-        self.meta
-            .get(entity.index as usize)
-            .is_some_and(|meta| meta.alive && meta.generation == entity.generation)
+        self.get(entity).is_some()
+    }
+
+    /// Records that the alive `entity` is now stored at `location`.
+    pub(crate) fn set_location(&mut self, entity: Entity, location: EntityLocation) {
+        debug_assert!(self.contains(entity));
+        self.meta[entity.index as usize].location = Some(location);
     }
 
     /// The number of alive entities.
@@ -132,6 +157,11 @@ impl Entities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HERE: EntityLocation = EntityLocation {
+        archetype: ArchetypeId::EMPTY,
+        row: 0,
+    };
 
     #[test]
     fn option_entity_has_a_niche() {
@@ -150,8 +180,8 @@ mod tests {
     #[test]
     fn alloc_hands_out_distinct_entities() {
         let mut entities = Entities::default();
-        let a = entities.alloc();
-        let b = entities.alloc();
+        let a = entities.alloc(HERE);
+        let b = entities.alloc(HERE);
         assert_ne!(a, b);
         assert!(entities.contains(a));
         assert!(entities.contains(b));
@@ -161,9 +191,9 @@ mod tests {
     #[test]
     fn reused_slot_gets_a_new_generation() {
         let mut entities = Entities::default();
-        let old = entities.alloc();
-        assert!(entities.free(old));
-        let new = entities.alloc();
+        let old = entities.alloc(HERE);
+        assert!(entities.free(old).is_some());
+        let new = entities.alloc(HERE);
 
         assert_eq!(new.index(), old.index());
         assert_eq!(new.generation(), old.generation() + 1);
@@ -175,19 +205,19 @@ mod tests {
     #[test]
     fn freeing_a_dead_entity_does_nothing() {
         let mut entities = Entities::default();
-        let entity = entities.alloc();
-        assert!(entities.free(entity));
-        assert!(!entities.free(entity));
+        let entity = entities.alloc(HERE);
+        assert!(entities.free(entity).is_some());
+        assert!(entities.free(entity).is_none());
         assert_eq!(entities.len(), 0);
 
         let never_allocated = Entity::new(100, NonZeroU32::MIN);
-        assert!(!entities.free(never_allocated));
+        assert!(entities.free(never_allocated).is_none());
     }
 
     #[test]
     fn forged_handle_to_a_free_slot_is_not_alive() {
         let mut entities = Entities::default();
-        let entity = entities.alloc();
+        let entity = entities.alloc(HERE);
         entities.free(entity);
         // This handle carries the generation the slot will have when reused.
         let forged = Entity::new(entity.index(), entity.generation.checked_add(1).unwrap());
@@ -197,12 +227,25 @@ mod tests {
     #[test]
     fn exhausted_slot_is_retired() {
         let mut entities = Entities::default();
-        let first = entities.alloc();
+        let first = entities.alloc(HERE);
         entities.meta[first.index() as usize].generation = NonZeroU32::MAX;
         let last_generation = Entity::new(first.index(), NonZeroU32::MAX);
 
-        assert!(entities.free(last_generation));
+        assert!(entities.free(last_generation).is_some());
         assert!(!entities.contains(last_generation));
-        assert_ne!(entities.alloc().index(), first.index());
+        assert_ne!(entities.alloc(HERE).index(), first.index());
+    }
+
+    #[test]
+    fn tracks_locations() {
+        let mut entities = Entities::default();
+        let entity = entities.alloc(HERE);
+        assert_eq!(entities.get(entity), Some(HERE));
+
+        let there = EntityLocation { row: 5, ..HERE };
+        entities.set_location(entity, there);
+        assert_eq!(entities.get(entity), Some(there));
+        assert_eq!(entities.free(entity), Some(there));
+        assert_eq!(entities.get(entity), None);
     }
 }
