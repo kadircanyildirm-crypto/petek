@@ -33,11 +33,16 @@ position.y += velocity.y;
 `petek` uses `unsafe` code for its type-erased storage, so it is held to a
 strict standard:
 
-- every `unsafe` block carries a `SAFETY` comment (enforced by Clippy);
-- the whole test suite runs under [Miri] with strict provenance in CI;
+- every `unsafe` block carries a `SAFETY` comment, and every `unsafe fn`
+  documents its contract (both enforced by Clippy);
 - structural changes run no user code until the world is consistent again,
-  so a panicking component destructor cannot cause a double drop or leave an
-  entity half-moved.
+  so a panicking destructor can neither cause a double drop nor leave an
+  entity half-moved;
+- CI runs the whole test suite under [Miri] with strict provenance, under both
+  the Stacked Borrows and Tree Borrows aliasing models, and on 32-bit and
+  big-endian targets.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the design and its invariants.
 
 [Miri]: https://github.com/rust-lang/miri
 
