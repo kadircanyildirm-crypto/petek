@@ -1,12 +1,15 @@
 //! Archetypes: tables that store every entity with exactly the same set of
-//! components.
+//! components, and the cached transitions between them.
 
-use std::collections::HashMap;
+use std::ptr::NonNull;
+use std::slice;
 
 use crate::bundle::{Bundle, BundleId};
 use crate::component::{ComponentId, Components};
 use crate::entity::Entity;
+use crate::hash::FastHashMap;
 use crate::storage::blob_vec::BlobVec;
+use crate::storage::drop_each;
 
 /// Identifies an archetype within one world.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -16,6 +19,7 @@ impl ArchetypeId {
     /// The archetype of entities that have no components.
     pub(crate) const EMPTY: Self = Self(0);
 
+    #[inline]
     fn index(self) -> usize {
         self.0 as usize
     }
@@ -27,8 +31,7 @@ impl ArchetypeId {
 /// component touches contiguous memory.
 ///
 /// Every column holds exactly one item per entity. Structural changes break
-/// this briefly, but restore it before any user code (a component's
-/// destructor) can run.
+/// this briefly, but restore it before any user code can run.
 pub(crate) struct Archetype {
     /// The components of this archetype, sorted.
     component_ids: Box<[ComponentId]>,
@@ -36,15 +39,16 @@ pub(crate) struct Archetype {
     columns: Box<[BlobVec]>,
     /// The entity in each row.
     entities: Vec<Entity>,
-    /// Cached targets of inserting a bundle into an entity of this archetype.
-    insert_edges: HashMap<BundleId, ArchetypeId>,
-    /// Cached targets of removing a bundle from an entity of this archetype;
-    /// `None` if the archetype lacks some of the bundle's components.
-    remove_edges: HashMap<BundleId, Option<ArchetypeId>>,
+    /// Transitions taken when a bundle is inserted into one of the entities.
+    insert_edges: FastHashMap<BundleId, TransitionId>,
+    /// Transitions taken when a bundle is removed from one of the entities;
+    /// `None` if this archetype lacks some of the bundle's components.
+    remove_edges: FastHashMap<BundleId, Option<TransitionId>>,
 }
 
-// SAFETY: columns are only ever created for components, which are
-// `Send + Sync`; everything else in an archetype is plain data.
+// SAFETY: columns are only ever built from `ComponentInfo`s, which only
+// describe components, and components are `Send + Sync`. Everything else in
+// an archetype is plain data.
 unsafe impl Send for Archetype {}
 // SAFETY: as above.
 unsafe impl Sync for Archetype {}
@@ -62,23 +66,31 @@ impl Archetype {
             component_ids,
             columns,
             entities: Vec::new(),
-            insert_edges: HashMap::new(),
-            remove_edges: HashMap::new(),
+            insert_edges: FastHashMap::default(),
+            remove_edges: FastHashMap::default(),
         }
     }
 
     /// The number of entities (rows).
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.entities.len()
     }
 
     /// The index of the column that stores component `id`, if there is one.
+    #[inline]
     pub(crate) fn column_index(&self, id: ComponentId) -> Option<usize> {
         self.component_ids.binary_search(&id).ok()
     }
 
+    #[inline]
     pub(crate) fn column(&self, index: usize) -> &BlobVec {
         &self.columns[index]
+    }
+
+    #[inline]
+    pub(crate) fn column_mut(&mut self, index: usize) -> &mut BlobVec {
+        &mut self.columns[index]
     }
 
     /// Checks, in debug builds, that every column holds one item per entity.
@@ -99,32 +111,50 @@ impl Archetype {
         }
     }
 
-    /// Pushes the components of `bundle` onto their columns, as part of a new
-    /// row.
+    /// Moves the components of `bundle` into the spare slots of their
+    /// columns, without counting them yet (see [`BlobVec::write_spare`]).
+    ///
+    /// Nothing about the archetype changes until
+    /// [`commit_staged`](Self::commit_staged) is called, so if the bundle
+    /// panics partway, the staged values are merely leaked.
+    ///
+    /// # Panics
+    ///
+    /// If the bundle hands over a different number of components than
+    /// `columns` lists, which only a broken `Bundle` implementation can do.
     ///
     /// # Safety
     ///
-    /// - `component_ids` must list the components of `B` in bundle order, and
-    ///   each must have a column here.
-    /// - The caller must complete the row before anything else accesses this
-    ///   archetype.
-    pub(crate) unsafe fn push_bundle<B: Bundle>(
-        &mut self,
-        bundle: B,
-        component_ids: &[ComponentId],
-    ) {
-        let mut ids = component_ids.iter();
+    /// - `columns` must list, in bundle order, the distinct columns that
+    ///   store the components of `B`.
+    /// - Each of those columns must have spare capacity.
+    pub(crate) unsafe fn stage_bundle<B: Bundle>(&mut self, bundle: B, columns: &[usize]) {
+        let mut columns = columns.iter();
         bundle.take_components(&mut |value| {
-            let id = ids
+            let &column = columns
                 .next()
                 .expect("bundle has more components than it reported");
-            let column = self
-                .column_index(*id)
-                .expect("archetype lacks a bundle component");
-            // SAFETY: the column stores this component, and `take_components`
-            // hands over a valid value that is now ours.
-            unsafe { self.columns[column].push(value) };
+            // SAFETY: the column stores this component and has room, and
+            // `take_components` hands over a valid value that is now ours.
+            unsafe { self.columns[column].write_spare(value) };
         });
+        assert!(
+            columns.next().is_none(),
+            "bundle has fewer components than it reported",
+        );
+    }
+
+    /// Counts the components previously staged in `columns`.
+    ///
+    /// # Safety
+    ///
+    /// [`stage_bundle`](Self::stage_bundle) must have staged a value in each
+    /// of these columns since they last changed.
+    pub(crate) unsafe fn commit_staged(&mut self, columns: &[usize]) {
+        for &column in columns {
+            // SAFETY: the caller guarantees a value was staged here.
+            unsafe { self.columns[column].commit_spare() };
+        }
     }
 
     /// Appends `entity`, completing the last row.
@@ -136,107 +166,70 @@ impl Archetype {
         self.entities.push(entity);
     }
 
-    /// Overwrites the components of `row` with those of `bundle`, dropping the
+    /// Overwrites components of `row` with those of `bundle`, dropping the
     /// old values.
+    ///
+    /// Each column stays consistent even if a destructor or the bundle
+    /// panics.
     ///
     /// # Safety
     ///
     /// - `row` must be less than `len()`.
-    /// - `component_ids` must list the components of `B` in bundle order, and
-    ///   each must have a column here.
+    /// - `columns` must list, in bundle order, the distinct columns that
+    ///   store the components of `B`.
     pub(crate) unsafe fn replace_bundle<B: Bundle>(
         &mut self,
         row: usize,
         bundle: B,
-        component_ids: &[ComponentId],
+        columns: &[usize],
     ) {
-        let mut ids = component_ids.iter();
+        debug_assert!(row < self.len());
+        let mut columns = columns.iter();
         bundle.take_components(&mut |value| {
-            let id = ids
+            let &column = columns
                 .next()
                 .expect("bundle has more components than it reported");
-            let column = self
-                .column_index(*id)
-                .expect("archetype lacks a bundle component");
             // SAFETY: `row` is in bounds, the column stores this component,
-            // and `take_components` hands over a valid value. The column stays
-            // consistent even if the old value's destructor panics.
+            // and `take_components` hands over a valid value.
             unsafe { self.columns[column].replace_unchecked(row, value) };
         });
     }
 
     /// Moves the entity at `row` to a new row at the end of `dst`, along with
-    /// each of its components that is not in `skip`.
+    /// the components listed in `moves` as `(column here, column in dst)`.
     ///
     /// This runs no user code, but leaves both archetypes incomplete: `row` is
-    /// still in the columns of the skipped components of `self`, and the new
-    /// row of `dst` lacks every component that did not come from `self`. The
-    /// caller must fix both before anything else accesses either archetype.
+    /// still in every column of `self` not listed in `moves`, and the new row
+    /// of `dst` lacks every component not listed there. The caller must
+    /// complete both before anything else accesses either archetype.
     ///
     /// Returns the entity that moved into `row` in `self`, if any.
     ///
     /// # Safety
     ///
     /// - `row` must be less than `len()`.
-    /// - `skip` must be sorted, and every component of `self` that is not in
-    ///   `skip` must have a column in `dst`.
+    /// - Each pair must map a column here to a column of `dst` that stores
+    ///   the same component; the columns must be distinct.
+    /// - `dst` must have room for one more row (see
+    ///   [`reserve`](Self::reserve)).
     pub(crate) unsafe fn move_row_to(
         &mut self,
         row: usize,
         dst: &mut Archetype,
-        skip: &[ComponentId],
+        moves: &[(usize, usize)],
     ) -> Option<Entity> {
-        // Reserve up front, so that nothing below can fail halfway through.
-        dst.reserve(1);
-        for (column, &id) in self.columns.iter_mut().zip(self.component_ids.iter()) {
-            if skip.binary_search(&id).is_ok() {
-                continue;
-            }
-            let dst_column = dst
-                .column_index(id)
-                .expect("target archetype lacks a moved component");
-            // SAFETY: `row` is in bounds, both columns store this component,
-            // and the value is moved rather than copied: `self` forgets it as
-            // `dst` takes it over.
+        debug_assert!(row < self.len());
+        for &(src_column, dst_column) in moves {
+            // SAFETY: `row` is in bounds, and the caller guarantees the
+            // destination column stores the same type and has room.
             unsafe {
-                let value = column.swap_remove_and_forget_unchecked(row);
-                dst.columns[dst_column].push(value);
+                self.columns[src_column]
+                    .swap_remove_into_unchecked(row, &mut dst.columns[dst_column]);
             }
         }
         let entity = self.entities.swap_remove(row);
         dst.entities.push(entity);
         self.entities.get(row).copied()
-    }
-
-    /// Removes `row` from the columns of `B`'s components, moving their values
-    /// into a new `B`.
-    ///
-    /// # Safety
-    ///
-    /// - `row` must be in bounds of each of those columns.
-    /// - `component_ids` must list the components of `B` in bundle order, and
-    ///   each must have a column here.
-    pub(crate) unsafe fn take_bundle<B: Bundle>(
-        &mut self,
-        row: usize,
-        component_ids: &[ComponentId],
-    ) -> B {
-        let mut ids = component_ids.iter();
-        let mut next = || {
-            let id = ids
-                .next()
-                .expect("bundle has more components than it reported");
-            let column = self
-                .column_index(*id)
-                .expect("archetype lacks a bundle component");
-            // SAFETY: `row` is in bounds of this column. The returned pointer
-            // stays valid until the column changes again, and each column is
-            // visited only once.
-            unsafe { self.columns[column].swap_remove_and_forget_unchecked(row) }
-        };
-        // SAFETY: `next` yields valid values of `B`'s components in bundle
-        // order, and ownership of each passes to the bundle.
-        unsafe { B::from_components(&mut next) }
     }
 
     /// Removes `row` from the entity list by moving the last entity into its
@@ -247,69 +240,136 @@ impl Archetype {
     /// `row` must be less than `len()`, and the caller must remove `row` from
     /// every column before anything else accesses this archetype.
     pub(crate) unsafe fn swap_remove_entity(&mut self, row: usize) -> Option<Entity> {
+        debug_assert!(row < self.len());
         self.entities.swap_remove(row);
         self.entities.get(row).copied()
     }
 
-    /// Removes `row` from the columns of every component `filter` selects,
-    /// dropping the values.
+    /// Removes `row` from every column, dropping its components.
     ///
     /// Since destructors run here, this must be the last step of a structural
-    /// change. If one panics, `row` is still removed from the remaining
-    /// columns (whose values are leaked), so the archetype stays consistent.
+    /// change. If one panics, `row` is still removed from the other columns
+    /// and their values dropped, so the archetype stays consistent.
     ///
     /// # Safety
     ///
-    /// `row` must be in bounds of every selected column.
-    pub(crate) unsafe fn drop_from_columns(
-        &mut self,
-        row: usize,
-        filter: impl Fn(ComponentId) -> bool,
-    ) {
-        /// Finishes removing the row if a destructor unwinds.
-        struct Guard<'a, F: Fn(ComponentId) -> bool> {
-            component_ids: &'a [ComponentId],
+    /// `row` must be in bounds of every column.
+    pub(crate) unsafe fn drop_row(&mut self, row: usize) {
+        let columns = &mut self.columns;
+        drop_each(0..columns.len(), |index| {
+            // SAFETY: the caller guarantees `row` is in bounds of this column.
+            unsafe { columns[index].swap_remove_and_drop_unchecked(row) };
+        });
+    }
+
+    /// Removes `row` from the given columns, dropping those components. Like
+    /// [`drop_row`](Self::drop_row), it finishes even if a destructor panics.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be in bounds of each of these columns, and the columns must
+    /// be distinct.
+    pub(crate) unsafe fn drop_from_columns(&mut self, row: usize, columns: &[usize]) {
+        let all = &mut self.columns;
+        drop_each(0..columns.len(), |index| {
+            // SAFETY: the caller guarantees `row` is in bounds of this column.
+            unsafe { all[columns[index]].swap_remove_and_drop_unchecked(row) };
+        });
+    }
+
+    /// Removes `row` from the given columns, moving their values into a new
+    /// `B`.
+    ///
+    /// If building the bundle panics, `row` is still removed from the columns
+    /// it did not get to, leaking those values, so the archetype stays
+    /// consistent.
+    ///
+    /// # Safety
+    ///
+    /// - `row` must be in bounds of each of these columns.
+    /// - `columns` must list, in bundle order, the distinct columns that
+    ///   store the components of `B`.
+    pub(crate) unsafe fn take_bundle<B: Bundle>(&mut self, row: usize, columns: &[usize]) -> B {
+        /// Removes `row` from the columns that are left when dropped.
+        struct Take<'a> {
             columns: &'a mut [BlobVec],
-            filter: F,
+            left: slice::Iter<'a, usize>,
             row: usize,
-            next: usize,
         }
 
-        impl<F: Fn(ComponentId) -> bool> Drop for Guard<'_, F> {
+        impl Take<'_> {
+            fn next(&mut self) -> NonNull<u8> {
+                let &column = self
+                    .left
+                    .next()
+                    .expect("bundle has more components than it reported");
+                // SAFETY: `take_bundle`'s caller guarantees `row` is in bounds
+                // of this column. The returned value stays valid until the
+                // column changes again, and each column is visited once.
+                unsafe { self.columns[column].swap_remove_and_forget_unchecked(self.row) }
+            }
+        }
+
+        impl Drop for Take<'_> {
             fn drop(&mut self) {
-                for index in self.next..self.columns.len() {
-                    if (self.filter)(self.component_ids[index]) {
-                        // SAFETY: the caller of `drop_from_columns`
-                        // guarantees `row` is in bounds of this column.
-                        unsafe { self.columns[index].swap_remove_and_forget_unchecked(self.row) };
-                    }
+                for &column in &mut self.left {
+                    // SAFETY: as in `next`.
+                    unsafe { self.columns[column].swap_remove_and_forget_unchecked(self.row) };
                 }
             }
         }
 
-        let mut guard = Guard {
-            component_ids: &self.component_ids,
+        let mut take = Take {
             columns: &mut self.columns,
-            filter,
+            left: columns.iter(),
             row,
-            next: 0,
         };
-        while guard.next < guard.columns.len() {
-            let index = guard.next;
-            guard.next += 1;
-            if (guard.filter)(guard.component_ids[index]) {
-                // SAFETY: the caller guarantees `row` is in bounds of this
-                // column.
-                unsafe { guard.columns[index].swap_remove_and_drop_unchecked(row) };
-            }
-        }
+        // SAFETY: `take.next` yields valid values of `B`'s components in
+        // bundle order, handing over ownership of each.
+        unsafe { B::from_components(&mut || take.next()) }
+    }
+
+    /// Removes every entity, dropping all components.
+    ///
+    /// Like [`drop_row`](Self::drop_row), it finishes even if a destructor
+    /// panics.
+    pub(crate) fn clear(&mut self) {
+        self.entities.clear();
+        let columns = &mut self.columns;
+        drop_each(0..columns.len(), |index| columns[index].clear());
     }
 }
 
-/// All archetypes of a world.
+/// Identifies a cached [`Transition`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct TransitionId(u32);
+
+/// A precomputed plan for moving an entity between archetypes when a bundle is
+/// inserted into or removed from it.
+///
+/// Its column indices are worked out once, the first time the transition is
+/// needed, so the structural change itself needs no lookups. No column is
+/// listed twice.
+pub(crate) struct Transition {
+    pub(crate) src: ArchetypeId,
+    pub(crate) dst: ArchetypeId,
+    /// For each component of the bundle, in bundle order: its column in `dst`
+    /// when inserting, or in `src` when removing.
+    pub(crate) bundle_columns: Box<[usize]>,
+    /// `(column in src, column in dst)` for each component that is carried
+    /// over unchanged. Empty if `src == dst`.
+    pub(crate) moved_columns: Box<[(usize, usize)]>,
+    /// When inserting into a different archetype, the columns of `src` whose
+    /// values the bundle replaces. Empty otherwise.
+    pub(crate) replaced_columns: Box<[usize]>,
+}
+
+/// All archetypes of a world, and the transitions between them.
 pub(crate) struct Archetypes {
-    archetypes: Vec<Archetype>,
-    by_components: HashMap<Box<[ComponentId]>, ArchetypeId>,
+    /// Indexed by `ArchetypeId`.
+    by_id: Vec<Archetype>,
+    by_components: FastHashMap<Box<[ComponentId]>, ArchetypeId>,
+    transitions: Vec<Transition>,
 }
 
 impl Archetypes {
@@ -317,94 +377,163 @@ impl Archetypes {
     pub(crate) fn new() -> Self {
         let empty = Archetype::new(Box::default(), &Components::default());
         Self {
-            archetypes: vec![empty],
-            by_components: HashMap::from([(Box::default(), ArchetypeId::EMPTY)]),
+            by_id: vec![empty],
+            by_components: [(Box::default(), ArchetypeId::EMPTY)].into_iter().collect(),
+            transitions: Vec::new(),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.archetypes.len()
+        self.by_id.len()
     }
 
+    #[inline]
     pub(crate) fn get(&self, id: ArchetypeId) -> &Archetype {
-        &self.archetypes[id.index()]
+        &self.by_id[id.index()]
     }
 
+    #[inline]
     pub(crate) fn get_mut(&mut self, id: ArchetypeId) -> &mut Archetype {
-        &mut self.archetypes[id.index()]
+        &mut self.by_id[id.index()]
     }
 
-    /// Returns two different archetypes at once.
-    ///
-    /// # Panics
-    ///
-    /// If `a == b`.
-    pub(crate) fn get_two_mut(
+    /// Returns a transition with its source archetype and, unless it is the
+    /// same, its target archetype.
+    #[inline]
+    pub(crate) fn split(
         &mut self,
-        a: ArchetypeId,
-        b: ArchetypeId,
-    ) -> (&mut Archetype, &mut Archetype) {
-        let (a, b) = (a.index(), b.index());
-        assert_ne!(a, b, "cannot borrow an archetype twice");
-        if a < b {
-            let (left, right) = self.archetypes.split_at_mut(b);
-            (&mut left[a], &mut right[0])
-        } else {
-            let (left, right) = self.archetypes.split_at_mut(a);
-            (&mut right[0], &mut left[b])
+        id: TransitionId,
+    ) -> (&Transition, &mut Archetype, Option<&mut Archetype>) {
+        let transition = &self.transitions[id.0 as usize];
+        let (src, dst) = (transition.src.index(), transition.dst.index());
+        if src == dst {
+            return (transition, &mut self.by_id[src], None);
         }
+        let (src, dst) = get_two_mut(&mut self.by_id, src, dst);
+        (transition, src, Some(dst))
     }
 
-    /// Returns the archetype an entity of `src` ends up in when `bundle`, with
-    /// the given sorted component ids, is inserted into it.
-    pub(crate) fn insert_target(
+    /// Returns the transition for inserting a bundle, with the given distinct
+    /// components in bundle order, into an entity of `src`.
+    pub(crate) fn insert_transition(
         &mut self,
         src: ArchetypeId,
         bundle: BundleId,
         bundle_ids: &[ComponentId],
         components: &Components,
-    ) -> ArchetypeId {
-        if let Some(&target) = self.get(src).insert_edges.get(&bundle) {
-            return target;
+    ) -> TransitionId {
+        if let Some(&id) = self.get(src).insert_edges.get(&bundle) {
+            return id;
         }
-        let mut ids = self.get(src).component_ids.to_vec();
-        ids.extend_from_slice(bundle_ids);
+        let mut ids: Vec<_> = self
+            .get(src)
+            .component_ids
+            .iter()
+            .chain(bundle_ids)
+            .copied()
+            .collect();
         ids.sort_unstable();
         ids.dedup();
-        let target = self.get_or_insert(ids, components);
-        self.get_mut(src).insert_edges.insert(bundle, target);
-        target
+        let dst = self.get_or_insert(ids, components);
+
+        let (src_archetype, dst_archetype) = (self.get(src), self.get(dst));
+        let column_in_dst = |id| {
+            dst_archetype
+                .column_index(id)
+                .expect("target has every component")
+        };
+        let bundle_columns = bundle_ids.iter().map(|&id| column_in_dst(id)).collect();
+        let (mut moved_columns, mut replaced_columns) = (Vec::new(), Vec::new());
+        if src != dst {
+            for (src_column, &id) in src_archetype.component_ids.iter().enumerate() {
+                if bundle_ids.contains(&id) {
+                    replaced_columns.push(src_column);
+                } else {
+                    moved_columns.push((src_column, column_in_dst(id)));
+                }
+            }
+        }
+
+        let id = self.push_transition(Transition {
+            src,
+            dst,
+            bundle_columns,
+            moved_columns: moved_columns.into(),
+            replaced_columns: replaced_columns.into(),
+        });
+        self.get_mut(src).insert_edges.insert(bundle, id);
+        id
     }
 
-    /// Returns the archetype an entity of `src` ends up in when `bundle`, with
-    /// the given sorted component ids, is removed from it, or `None` if `src`
-    /// lacks any of the bundle's components.
-    pub(crate) fn remove_target(
+    /// Returns the transition for removing a bundle, with the given distinct
+    /// components in bundle order, from an entity of `src`, or `None` if
+    /// `src` lacks any of them.
+    pub(crate) fn remove_transition(
         &mut self,
         src: ArchetypeId,
         bundle: BundleId,
         bundle_ids: &[ComponentId],
         components: &Components,
-    ) -> Option<ArchetypeId> {
-        if let Some(&target) = self.get(src).remove_edges.get(&bundle) {
-            return target;
+    ) -> Option<TransitionId> {
+        if let Some(&id) = self.get(src).remove_edges.get(&bundle) {
+            return id;
         }
-        let src_ids = &self.get(src).component_ids;
-        let target = if bundle_ids
+        let src_archetype = self.get(src);
+        let id = if bundle_ids
             .iter()
-            .all(|id| src_ids.binary_search(id).is_ok())
+            .all(|&id| src_archetype.column_index(id).is_some())
         {
-            let ids = src_ids
+            let ids = src_archetype
+                .component_ids
                 .iter()
                 .copied()
-                .filter(|id| bundle_ids.binary_search(id).is_err())
+                .filter(|id| !bundle_ids.contains(id))
                 .collect();
-            Some(self.get_or_insert(ids, components))
+            let dst = self.get_or_insert(ids, components);
+
+            let (src_archetype, dst_archetype) = (self.get(src), self.get(dst));
+            let column_in_src = |id| {
+                src_archetype
+                    .column_index(id)
+                    .expect("source has every component")
+            };
+            let bundle_columns = bundle_ids.iter().map(|&id| column_in_src(id)).collect();
+            let moved_columns = if src == dst {
+                Box::default()
+            } else {
+                dst_archetype
+                    .component_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(dst_column, &id)| (column_in_src(id), dst_column))
+                    .collect()
+            };
+            Some(self.push_transition(Transition {
+                src,
+                dst,
+                bundle_columns,
+                moved_columns,
+                replaced_columns: Box::default(),
+            }))
         } else {
             None
         };
-        self.get_mut(src).remove_edges.insert(bundle, target);
-        target
+        self.get_mut(src).remove_edges.insert(bundle, id);
+        id
+    }
+
+    /// Removes every entity from every archetype, dropping all components.
+    ///
+    /// Like [`Archetype::drop_row`], it finishes even if a destructor panics.
+    pub(crate) fn clear_entities(&mut self) {
+        let archetypes = &mut self.by_id;
+        drop_each(0..archetypes.len(), |index| archetypes[index].clear());
+    }
+
+    fn push_transition(&mut self, transition: Transition) -> TransitionId {
+        let id = TransitionId(u32::try_from(self.transitions.len()).expect("too many transitions"));
+        self.transitions.push(transition);
+        id
     }
 
     /// Returns the archetype with exactly these sorted components, creating it
@@ -418,11 +547,93 @@ impl Archetypes {
         if let Some(&id) = self.by_components.get(component_ids.as_slice()) {
             return id;
         }
-        let id = ArchetypeId(u32::try_from(self.archetypes.len()).expect("too many archetypes"));
+        let id = ArchetypeId(u32::try_from(self.by_id.len()).expect("too many archetypes"));
         let component_ids: Box<[ComponentId]> = component_ids.into();
-        self.archetypes
+        self.by_id
             .push(Archetype::new(component_ids.clone(), components));
         self.by_components.insert(component_ids, id);
         id
+    }
+}
+
+/// Borrows two different elements of a slice mutably.
+fn get_two_mut<T>(slice: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
+    assert_ne!(a, b, "cannot borrow an element twice");
+    if a < b {
+        let (left, right) = slice.split_at_mut(b);
+        (&mut left[a], &mut right[0])
+    } else {
+        let (left, right) = slice.split_at_mut(a);
+        (&mut right[0], &mut left[b])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::Bundles;
+    use crate::component::Component;
+
+    struct A;
+    impl Component for A {}
+
+    struct B;
+    impl Component for B {}
+
+    struct C;
+    impl Component for C {}
+
+    fn ids_of<T: Bundle>(
+        bundles: &mut Bundles,
+        components: &mut Components,
+    ) -> (BundleId, Box<[ComponentId]>) {
+        let id = bundles.register::<T>(components);
+        (id, bundles.info(id).component_ids.clone())
+    }
+
+    #[test]
+    fn transitions_are_computed_once_and_cached() {
+        let (mut components, mut bundles) = (Components::default(), Bundles::default());
+        let mut archetypes = Archetypes::new();
+        let (ab, ab_ids) = ids_of::<(A, B)>(&mut bundles, &mut components);
+        let (cb, cb_ids) = ids_of::<(C, B)>(&mut bundles, &mut components);
+
+        let spawn = archetypes.insert_transition(ArchetypeId::EMPTY, ab, &ab_ids, &components);
+        assert_eq!(
+            archetypes.insert_transition(ArchetypeId::EMPTY, ab, &ab_ids, &components),
+            spawn
+        );
+        let with_ab = archetypes.transitions[spawn.0 as usize].dst;
+
+        // Inserting (C, B) into {A, B}: A moves, B is replaced, C is new.
+        let insert = archetypes.insert_transition(with_ab, cb, &cb_ids, &components);
+        let insert = &archetypes.transitions[insert.0 as usize];
+        let with_abc = insert.dst;
+        assert_eq!(archetypes.get(with_abc).component_ids.len(), 3);
+        assert_eq!(&*insert.moved_columns, [(0, 0)]);
+        assert_eq!(&*insert.replaced_columns, [1]);
+        assert_eq!(&*insert.bundle_columns, [2, 1]);
+
+        // Removing (C, B) from {A, B} is impossible, but from {A, B, C} it
+        // leaves {A}.
+        assert_eq!(
+            archetypes.remove_transition(with_ab, cb, &cb_ids, &components),
+            None
+        );
+        let removal = archetypes
+            .remove_transition(with_abc, cb, &cb_ids, &components)
+            .unwrap();
+        let removal = &archetypes.transitions[removal.0 as usize];
+        assert_eq!(&*removal.bundle_columns, [2, 1]);
+        assert_eq!(&*removal.moved_columns, [(0, 0)]);
+        assert_eq!(archetypes.len(), 4);
+    }
+
+    #[test]
+    fn get_two_mut_borrows_both_orders() {
+        let mut items = [1, 2, 3];
+        let (a, b) = get_two_mut(&mut items, 2, 0);
+        std::mem::swap(a, b);
+        assert_eq!(items, [3, 2, 1]);
     }
 }

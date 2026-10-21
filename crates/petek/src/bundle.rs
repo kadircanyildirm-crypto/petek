@@ -2,11 +2,11 @@
 //! together.
 
 use std::any::{TypeId, type_name};
-use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
 use crate::component::{Component, ComponentId, ComponentInfo, Components};
+use crate::hash::FastHashMap;
 
 /// A group of components that are added to or removed from an entity
 /// together.
@@ -15,26 +15,42 @@ use crate::component::{Component, ComponentId, ComponentInfo, Components};
 /// bundles. Tuples nest, so `((A, B), C)` is a bundle too, and `()` is the
 /// empty bundle.
 ///
+/// ```
+/// use petek::{Component, World};
+///
+/// struct Position(f32, f32);
+/// impl Component for Position {}
+///
+/// struct Velocity(f32, f32);
+/// impl Component for Velocity {}
+///
+/// let mut world = World::new();
+/// let entity = world.spawn((Position(0.0, 0.0), Velocity(1.0, 0.0)));
+/// world.remove::<(Position, Velocity)>(entity).unwrap();
+/// assert!(!world.has::<Position>(entity));
+/// ```
+///
 /// # Safety
 ///
-/// Worlds move components in and out of bundles through raw pointers, so an
-/// implementation must guarantee that:
+/// Implementing this trait by hand is not supported: it is implemented for
+/// every component and every tuple of bundles, and its methods are an
+/// implementation detail that may change. A derive macro for named bundles is
+/// planned.
 ///
-/// - [`component_infos`](Self::component_infos) reports the same components,
-///   in the same order, on every call;
-/// - [`take_components`](Self::take_components) calls `f` exactly once per
-///   component, in that order, each time with a pointer to a valid value of
-///   that component's type;
-/// - [`from_components`](Self::from_components) calls `f` exactly once per
-///   component, in that order.
+/// Internally, worlds move components into and out of bundles through raw
+/// pointers. They rely on `component_infos` describing exactly the components
+/// that `take_components` hands over and `from_components` takes, in the same
+/// order.
 pub unsafe trait Bundle: 'static {
     /// Calls `f` with the description of each component in the bundle.
+    #[doc(hidden)]
     fn component_infos(f: &mut impl FnMut(ComponentInfo));
 
     /// Moves each component out of the bundle by handing `f` a pointer to it.
     ///
     /// `f` takes ownership of the value behind the pointer and must move it
     /// out before returning.
+    #[doc(hidden)]
     fn take_components(self, f: &mut impl FnMut(NonNull<u8>));
 
     /// Builds a bundle from the components that `f` points to.
@@ -43,6 +59,7 @@ pub unsafe trait Bundle: 'static {
     ///
     /// Each call to `f` must return a pointer to a valid value of the next
     /// component's type, and ownership of that value passes to the bundle.
+    #[doc(hidden)]
     unsafe fn from_components(f: &mut impl FnMut() -> NonNull<u8>) -> Self;
 }
 
@@ -110,17 +127,16 @@ pub(crate) struct BundleId(u32);
 
 /// What a world knows about a bundle type.
 pub(crate) struct BundleInfo {
-    /// The bundle's components, in the order the bundle visits them.
+    /// The bundle's components, in the order the bundle visits them. No
+    /// component appears twice.
     pub(crate) component_ids: Box<[ComponentId]>,
-    /// The same ids, sorted for set operations against archetypes.
-    pub(crate) sorted_ids: Box<[ComponentId]>,
 }
 
 /// Assigns a [`BundleId`] to each bundle type a world encounters.
 #[derive(Default)]
 pub(crate) struct Bundles {
     infos: Vec<BundleInfo>,
-    ids: HashMap<TypeId, BundleId>,
+    ids: FastHashMap<TypeId, BundleId>,
 }
 
 impl Bundles {
@@ -130,15 +146,16 @@ impl Bundles {
     /// # Panics
     ///
     /// If `B` contains the same component more than once.
+    #[track_caller]
     pub(crate) fn register<B: Bundle>(&mut self, components: &mut Components) -> BundleId {
         if let Some(&id) = self.ids.get(&TypeId::of::<B>()) {
             return id;
         }
         let mut component_ids = Vec::new();
         B::component_infos(&mut |info| component_ids.push(components.register(info)));
-        let mut sorted_ids = component_ids.clone();
-        sorted_ids.sort_unstable();
-        if let Some(pair) = sorted_ids.windows(2).find(|pair| pair[0] == pair[1]) {
+        let mut sorted = component_ids.clone();
+        sorted.sort_unstable();
+        if let Some(pair) = sorted.windows(2).find(|pair| pair[0] == pair[1]) {
             panic!(
                 "bundle `{}` contains component `{}` more than once",
                 type_name::<B>(),
@@ -149,12 +166,12 @@ impl Bundles {
         let id = BundleId(u32::try_from(self.infos.len()).expect("too many bundle types"));
         self.infos.push(BundleInfo {
             component_ids: component_ids.into(),
-            sorted_ids: sorted_ids.into(),
         });
         self.ids.insert(TypeId::of::<B>(), id);
         id
     }
 
+    #[inline]
     pub(crate) fn info(&self, id: BundleId) -> &BundleInfo {
         &self.infos[id.0 as usize]
     }
@@ -194,18 +211,24 @@ mod tests {
 
     #[test]
     fn components_round_trip_through_storage() {
-        type Pair = (A, (B, C));
+        type Nested = (A, (B, C));
 
         // Move each component into a column of its own...
         let mut columns = Vec::new();
-        Pair::component_infos(&mut |info| {
-            columns.push(BlobVec::new(info.layout(), info.drop_fn()));
+        Nested::component_infos(&mut |info| {
+            let mut column = BlobVec::new(info.layout(), info.drop_fn());
+            column.reserve(1);
+            columns.push(column);
         });
         let mut next = 0;
         (A(7), (B("seven".into()), C)).take_components(&mut |value| {
             // SAFETY: `component_infos` and `take_components` visit the
-            // components in the same order, so `value` matches the column.
-            unsafe { columns[next].push(value) };
+            // components in the same order, so `value` matches the column,
+            // which has room for it.
+            unsafe {
+                columns[next].write_spare(value);
+                columns[next].commit_spare();
+            }
             next += 1;
         });
 
@@ -218,8 +241,8 @@ mod tests {
             unsafe { columns[next - 1].swap_remove_and_forget_unchecked(0) }
         };
         // SAFETY: `read` yields the components in bundle order.
-        let pair = unsafe { Pair::from_components(&mut read) };
-        assert_eq!(pair, (A(7), (B("seven".into()), C)));
+        let nested = unsafe { Nested::from_components(&mut read) };
+        assert_eq!(nested, (A(7), (B("seven".into()), C)));
     }
 
     #[test]
@@ -231,11 +254,11 @@ mod tests {
 
         assert_eq!(bundles.register::<(A, B)>(&mut components), ab);
         assert_ne!(ab, ba);
-        assert_eq!(bundles.info(ab).sorted_ids, bundles.info(ba).sorted_ids);
-        assert_ne!(
-            bundles.info(ab).component_ids,
-            bundles.info(ba).component_ids
+        let (ab, ba) = (
+            &bundles.info(ab).component_ids,
+            &bundles.info(ba).component_ids,
         );
+        assert_eq!([ab[0], ab[1]], [ba[1], ba[0]]);
     }
 
     #[test]

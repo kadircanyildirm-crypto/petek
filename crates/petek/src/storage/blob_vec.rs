@@ -1,8 +1,10 @@
 //! A `Vec` whose item type is only known at runtime.
 
 use std::alloc::{self, Layout};
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
+
+use super::drop_each;
 
 /// Drops a value through a type-erased pointer.
 ///
@@ -18,7 +20,7 @@ pub(crate) fn drop_fn_of<T>() -> Option<DropFn> {
         // SAFETY: the caller guarantees that `ptr` points to an owned `T`.
         unsafe { ptr.cast::<T>().drop_in_place() }
     }
-    std::mem::needs_drop::<T>().then_some(drop_ptr::<T> as DropFn)
+    mem::needs_drop::<T>().then_some(drop_ptr::<T> as DropFn)
 }
 
 /// A growable array of items described only by a [`Layout`] and a [`DropFn`].
@@ -27,6 +29,9 @@ pub(crate) fn drop_fn_of<T>() -> Option<DropFn> {
 /// like `Vec<T>` with the type erased. The vector does not know `T`, so most
 /// methods are `unsafe` and rely on the caller to only hand it pointers to
 /// values of the type it was created for.
+///
+/// Like `Vec`, it drops its items when dropped, keeps dropping the remaining
+/// ones if a destructor panics, and frees its allocation either way.
 pub(crate) struct BlobVec {
     /// Layout of one item, padded to a multiple of its alignment.
     item_layout: Layout,
@@ -41,7 +46,7 @@ pub(crate) struct BlobVec {
 
 impl BlobVec {
     /// Creates an empty vector for items with the given layout and drop
-    /// function. Nothing is allocated until the first push.
+    /// function. Nothing is allocated until an item is added.
     pub(crate) fn new(item_layout: Layout, drop: Option<DropFn>) -> Self {
         let item_layout = item_layout.pad_to_align();
         let capacity = if item_layout.size() == 0 {
@@ -58,71 +63,100 @@ impl BlobVec {
         }
     }
 
+    /// The number of items.
+    #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Makes room for at least `additional` more items.
+    #[inline]
     pub(crate) fn reserve(&mut self, additional: usize) {
-        let required = self.len.checked_add(additional).expect("capacity overflow");
-        if required > self.capacity {
-            self.grow(required);
+        if additional > self.capacity - self.len {
+            self.grow(additional);
         }
     }
 
     #[cold]
-    fn grow(&mut self, required: usize) {
+    #[inline(never)]
+    fn grow(&mut self, additional: usize) {
         // Zero-sized items have unlimited capacity, so only sized items get here.
         debug_assert_ne!(self.item_layout.size(), 0);
+        let required = self.len.checked_add(additional).expect("capacity overflow");
         let new_capacity = required.max(self.capacity * 2).max(4);
         let new_layout = array_layout(self.item_layout, new_capacity).expect("capacity overflow");
-        let new_data = if self.capacity == 0 {
-            // SAFETY: items are sized and `new_capacity > 0`, so the layout
-            // is not zero-sized.
-            unsafe { alloc::alloc(new_layout) }
-        } else {
-            let old_layout = array_layout(self.item_layout, self.capacity)
-                .expect("the current allocation has a valid layout");
+        let new_data = match self.allocation() {
+            // SAFETY: items are sized and `new_capacity > 0`, so the layout is
+            // not zero-sized.
+            None => unsafe { alloc::alloc(new_layout) },
             // SAFETY: `data` was allocated by the global allocator with
-            // `old_layout`, and `new_layout` validated that the new size is
+            // `old_layout`, and `new_layout` checked that the new size is
             // non-zero and does not overflow `isize` when aligned.
-            unsafe { alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size()) }
+            Some(old_layout) => unsafe {
+                alloc::realloc(self.data.as_ptr(), old_layout, new_layout.size())
+            },
         };
         self.data = NonNull::new(new_data).unwrap_or_else(|| alloc::handle_alloc_error(new_layout));
         self.capacity = new_capacity;
     }
 
-    /// Moves the value behind `value` to the end of the vector.
+    /// Moves the value behind `value` into the spare slot just past the end,
+    /// without counting it yet.
     ///
-    /// If this panics (on capacity overflow), the value is leaked.
+    /// Until [`commit_spare`](Self::commit_spare) is called, the vector does
+    /// not own the value: it is leaked if the vector changes in the meantime.
+    /// Writing a value first and committing it later lets callers fill several
+    /// columns and only update them once nothing can fail anymore.
     ///
     /// # Safety
     ///
-    /// - `value` must point to a valid value of this vector's item type.
-    /// - The value is moved into the vector: the caller must not use or drop
-    ///   it afterwards (wrap it in `ManuallyDrop` or `mem::forget` it).
-    /// - `value` must not point into this vector, since pushing may
-    ///   reallocate.
-    pub(crate) unsafe fn push(&mut self, value: NonNull<u8>) {
-        self.reserve(1);
-        // SAFETY: `reserve` made room for the slot at `len`, and the caller
-        // guarantees `value` is a valid item outside this vector.
+    /// - There must be spare capacity, as ensured by [`reserve`](Self::reserve).
+    /// - `value` must point to a valid value of this vector's item type,
+    ///   outside this vector. The value is moved: the caller must not use or
+    ///   drop it afterwards.
+    #[inline]
+    pub(crate) unsafe fn write_spare(&mut self, value: NonNull<u8>) {
+        debug_assert!(self.len < self.capacity);
+        // SAFETY: the caller guarantees there is a spare slot at `len` and that
+        // `value` is a valid item outside this vector.
         unsafe {
-            let slot = self.slot(self.len);
-            ptr::copy_nonoverlapping(value.as_ptr(), slot.as_ptr(), self.item_layout.size());
+            let spare = self.slot(self.len);
+            ptr::copy_nonoverlapping(value.as_ptr(), spare.as_ptr(), self.item_layout.size());
         }
+    }
+
+    /// Takes ownership of the value written by
+    /// [`write_spare`](Self::write_spare), making it the last item.
+    ///
+    /// # Safety
+    ///
+    /// A value must have been written with `write_spare` since the length of
+    /// this vector last changed.
+    #[inline]
+    pub(crate) unsafe fn commit_spare(&mut self) {
+        debug_assert!(self.len < self.capacity);
         self.len += 1;
     }
 
-    /// Returns a pointer to the item at `index`.
-    ///
-    /// The pointer may be used to mutate the item for as long as the caller
-    /// ensures no other access to it overlaps.
+    /// Returns a pointer to the item at `index`, for reading.
     ///
     /// # Safety
     ///
     /// `index` must be less than `len`.
+    #[inline]
     pub(crate) unsafe fn get_unchecked(&self, index: usize) -> NonNull<u8> {
+        debug_assert!(index < self.len);
+        // SAFETY: the caller guarantees `index < len <= capacity`.
+        unsafe { self.slot(index) }
+    }
+
+    /// Returns a pointer to the item at `index`, for reading and writing.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be less than `len`.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> NonNull<u8> {
         debug_assert!(index < self.len);
         // SAFETY: the caller guarantees `index < len <= capacity`.
         unsafe { self.slot(index) }
@@ -130,37 +164,44 @@ impl BlobVec {
 
     /// Drops the item at `index` and moves `value` into its place.
     ///
-    /// If this panics (on capacity overflow, or in the old item's destructor),
-    /// the vector stays valid and `value` is either stored or leaked.
+    /// `value` is moved in even if the old item's destructor panics, so the
+    /// slot always ends up holding a valid item.
     ///
     /// # Safety
     ///
     /// - `index` must be less than `len`.
     /// - `value` must satisfy the same requirements as for
-    ///   [`push`](Self::push).
+    ///   [`write_spare`](Self::write_spare).
     pub(crate) unsafe fn replace_unchecked(&mut self, index: usize, value: NonNull<u8>) {
+        /// Moves `value` into the slot when dropped, on return or unwind.
+        struct MoveIn {
+            value: NonNull<u8>,
+            slot: NonNull<u8>,
+            size: usize,
+        }
+
+        impl Drop for MoveIn {
+            fn drop(&mut self) {
+                // SAFETY: `replace_unchecked`'s caller guarantees `value` is a
+                // valid item outside the vector, and `slot` is the in-bounds
+                // slot whose old item has just been dropped.
+                unsafe {
+                    ptr::copy_nonoverlapping(self.value.as_ptr(), self.slot.as_ptr(), self.size);
+                }
+            }
+        }
+
         debug_assert!(index < self.len);
-        let size = self.item_layout.size();
-        let Some(drop_fn) = self.drop else {
-            // SAFETY: `index < len`, and the caller guarantees `value` is a
-            // valid item outside this vector.
-            unsafe { ptr::copy_nonoverlapping(value.as_ptr(), self.slot(index).as_ptr(), size) };
-            return;
+        let move_in = MoveIn {
+            value,
+            // SAFETY: the caller guarantees `index < len`.
+            slot: unsafe { self.slot(index) },
+            size: self.item_layout.size(),
         };
-        // If the old item's destructor panics, the slot must already hold the
-        // new item, or the old one would be dropped a second time later. So
-        // the old item is first moved to the spare slot just past the end,
-        // where nothing will ever drop it again.
-        self.reserve(1);
-        // SAFETY: after `reserve`, `index < len < capacity`, so both slots are
-        // in bounds and distinct. The old item is moved out before `value` is
-        // moved in, and is then dropped exactly once.
-        unsafe {
-            let slot = self.slot(index);
-            let spare = self.slot(self.len);
-            ptr::copy_nonoverlapping(slot.as_ptr(), spare.as_ptr(), size);
-            ptr::copy_nonoverlapping(value.as_ptr(), slot.as_ptr(), size);
-            drop_fn(spare);
+        if let Some(drop_fn) = self.drop {
+            // SAFETY: the slot holds a valid item, which is dropped exactly
+            // once before `move_in` refills the slot.
+            unsafe { drop_fn(move_in.slot) };
         }
     }
 
@@ -185,7 +226,7 @@ impl BlobVec {
     ///
     /// Returns a pointer to the removed item, which now sits just past the
     /// end of the vector. The caller takes ownership of it and must move it
-    /// out or drop it before the vector is mutated again.
+    /// out or drop it before the vector changes again.
     ///
     /// # Safety
     ///
@@ -212,19 +253,57 @@ impl BlobVec {
         last_slot
     }
 
-    /// Drops all items, keeping the allocation.
-    pub(crate) fn clear(&mut self) {
-        let len = self.len;
-        // Shrink first: if a destructor panics, the remaining items leak
-        // instead of being dropped twice.
-        self.len = 0;
-        if let Some(drop_fn) = self.drop {
-            for index in 0..len {
-                // SAFETY: every item below the old `len` is valid, and is no
-                // longer counted by `len`, so each is dropped exactly once.
-                unsafe { drop_fn(self.slot(index)) };
+    /// Moves the item at `index` to the end of `dst`, moving this vector's
+    /// last item into its place.
+    ///
+    /// # Safety
+    ///
+    /// - `index` must be less than `len`.
+    /// - `dst` must store the same item type, and must have spare capacity.
+    pub(crate) unsafe fn swap_remove_into_unchecked(&mut self, index: usize, dst: &mut BlobVec) {
+        debug_assert!(index < self.len);
+        debug_assert_eq!(self.item_layout, dst.item_layout);
+        let last = self.len - 1;
+        // SAFETY: `index < len`, and `dst` stores the same type and has room,
+        // so the item moves over and `self` stops counting it below. If it was
+        // not the last item, the last one fills the hole: both slots are in
+        // bounds and distinct.
+        unsafe {
+            dst.write_spare(self.slot(index));
+            dst.commit_spare();
+            if index != last {
+                ptr::copy_nonoverlapping(
+                    self.slot(last).as_ptr(),
+                    self.slot(index).as_ptr(),
+                    self.item_layout.size(),
+                );
             }
         }
+        self.len = last;
+    }
+
+    /// Drops all items, keeping the allocation.
+    pub(crate) fn clear(&mut self) {
+        // With `len` already zero, no item can be dropped twice, even if a
+        // destructor panics.
+        let len = mem::replace(&mut self.len, 0);
+        let Some(drop_fn) = self.drop else {
+            return;
+        };
+        drop_each(0..len, |index| {
+            // SAFETY: the items below the old `len` are valid and no longer
+            // counted, so each is dropped exactly once.
+            unsafe { drop_fn(self.slot(index)) };
+        });
+    }
+
+    /// The layout of the current allocation, or `None` if nothing is
+    /// allocated.
+    fn allocation(&self) -> Option<Layout> {
+        if self.item_layout.size() == 0 || self.capacity == 0 {
+            return None;
+        }
+        Some(array_layout(self.item_layout, self.capacity).expect("the allocated layout is valid"))
     }
 
     /// Returns a pointer to the slot at `index`, which may be past `len`.
@@ -232,8 +311,9 @@ impl BlobVec {
     /// # Safety
     ///
     /// `index` must not exceed `capacity`.
+    #[inline]
     unsafe fn slot(&self, index: usize) -> NonNull<u8> {
-        // SAFETY: with `index <= capacity` the offset stays within the
+        // SAFETY: with `index <= capacity`, the offset stays within the
         // allocation (or is zero for zero-sized items), so it cannot overflow.
         unsafe { self.data.add(index * self.item_layout.size()) }
     }
@@ -241,16 +321,19 @@ impl BlobVec {
 
 impl Drop for BlobVec {
     fn drop(&mut self) {
-        // If an item's destructor panics, the allocation below leaks, which
-        // is safe.
-        self.clear();
-        if self.item_layout.size() != 0 && self.capacity != 0 {
-            let layout = array_layout(self.item_layout, self.capacity)
-                .expect("the current allocation has a valid layout");
-            // SAFETY: `data` was allocated by the global allocator with this
-            // layout and is not used again.
-            unsafe { alloc::dealloc(self.data.as_ptr(), layout) };
+        /// Frees the allocation when dropped, even if a destructor panics.
+        struct Free(NonNull<u8>, Layout);
+
+        impl Drop for Free {
+            fn drop(&mut self) {
+                // SAFETY: the pointer was allocated by the global allocator
+                // with this layout, and its vector is going away.
+                unsafe { alloc::dealloc(self.0.as_ptr(), self.1) };
+            }
         }
+
+        let _free = self.allocation().map(|layout| Free(self.data, layout));
+        self.clear();
     }
 }
 
@@ -276,7 +359,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A typed wrapper so the tests can drive `BlobVec` through a safe API.
+    /// A typed wrapper, so the tests can drive `BlobVec` through a safe API.
     struct Typed<T>(BlobVec, PhantomData<T>);
 
     impl<T> Typed<T> {
@@ -293,9 +376,13 @@ mod tests {
 
         fn push(&mut self, value: T) {
             let mut value = ManuallyDrop::new(value);
-            // SAFETY: the vector was created for `T`, and `ManuallyDrop` hands
-            // ownership of the value over to it.
-            unsafe { self.0.push(NonNull::from(&mut *value).cast()) }
+            self.0.reserve(1);
+            // SAFETY: there is room, the vector was created for `T`, and
+            // `ManuallyDrop` hands ownership of the value over.
+            unsafe {
+                self.0.write_spare(NonNull::from(&mut *value).cast());
+                self.0.commit_spare();
+            }
         }
 
         fn get(&self, index: usize) -> &T {
@@ -304,13 +391,20 @@ mod tests {
             unsafe { self.0.get_unchecked(index).cast::<T>().as_ref() }
         }
 
+        fn get_mut(&mut self, index: usize) -> &mut T {
+            assert!(index < self.len());
+            // SAFETY: `index` is in bounds, the item is a `T`, and `&mut self`
+            // makes the access exclusive.
+            unsafe { self.0.get_unchecked_mut(index).cast::<T>().as_mut() }
+        }
+
         fn replace(&mut self, index: usize, value: T) {
             assert!(index < self.len());
             let mut value = ManuallyDrop::new(value);
             // SAFETY: as in `push`, and `index` is in bounds.
             unsafe {
                 self.0
-                    .replace_unchecked(index, NonNull::from(&mut *value).cast())
+                    .replace_unchecked(index, NonNull::from(&mut *value).cast());
             }
         }
 
@@ -331,9 +425,16 @@ mod tests {
             // SAFETY: `index` is in bounds.
             unsafe { self.0.swap_remove_and_drop_unchecked(index) }
         }
+
+        fn swap_remove_into(&mut self, index: usize, dst: &mut Self) {
+            assert!(index < self.len());
+            dst.0.reserve(1);
+            // SAFETY: `index` is in bounds, and `dst` stores `T` and has room.
+            unsafe { self.0.swap_remove_into_unchecked(index, &mut dst.0) }
+        }
     }
 
-    /// Counts how many times values sharing the same counter were dropped.
+    /// Counts drops in a shared counter, and optionally panics when dropped.
     struct Tracked {
         id: u32,
         drops: Rc<Cell<u32>>,
@@ -348,14 +449,18 @@ mod tests {
                 panic_on_drop: false,
             }
         }
+
+        fn bomb(id: u32, drops: &Rc<Cell<u32>>) -> Self {
+            let mut bomb = Self::new(id, drops);
+            bomb.panic_on_drop = true;
+            bomb
+        }
     }
 
     impl Drop for Tracked {
         fn drop(&mut self) {
             self.drops.set(self.drops.get() + 1);
-            if self.panic_on_drop {
-                panic!("Tracked({}) panicked on drop", self.id);
-            }
+            assert!(!self.panic_on_drop, "Tracked({}) panicked on drop", self.id);
         }
     }
 
@@ -365,8 +470,10 @@ mod tests {
         for i in 0..100 {
             vec.push(i * 3);
         }
+        *vec.get_mut(7) += 1;
         assert_eq!(vec.len(), 100);
-        assert!((0..100).all(|i| *vec.get(i as usize) == i * 3));
+        assert_eq!(*vec.get(7), 22);
+        assert!((8..100).all(|i| *vec.get(i) == i as u64 * 3));
     }
 
     #[test]
@@ -379,6 +486,34 @@ mod tests {
         assert_eq!([vec.get(0), vec.get(1), vec.get(2)], ["a", "d", "c"]);
         assert_eq!(vec.swap_remove(2), "c");
         assert_eq!(vec.len(), 2);
+    }
+
+    #[test]
+    fn swap_remove_into_moves_items_between_vectors() {
+        let mut src = Typed::<String>::new();
+        let mut dst = Typed::<String>::new();
+        for word in ["a", "b", "c"] {
+            src.push(word.to_owned());
+        }
+        src.swap_remove_into(0, &mut dst);
+        src.swap_remove_into(1, &mut dst);
+        assert_eq!([dst.get(0), dst.get(1)], ["a", "b"]);
+        assert_eq!(src.len(), 1);
+        assert_eq!(src.get(0), "c");
+    }
+
+    #[test]
+    fn staged_values_are_only_owned_once_committed() {
+        let mut vec = Typed::<String>::new();
+        vec.push("kept".to_owned());
+        let mut staged = ManuallyDrop::new("staged".to_owned());
+        vec.0.reserve(1);
+        // SAFETY: there is room, and the vector stores `String`s.
+        unsafe { vec.0.write_spare(NonNull::from(&mut *staged).cast()) };
+        assert_eq!(vec.len(), 1);
+        // SAFETY: a value was just written.
+        unsafe { vec.0.commit_spare() };
+        assert_eq!(vec.get(1), "staged");
     }
 
     #[test]
@@ -406,27 +541,10 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_items_and_keeps_the_vector_usable() {
+    fn replace_moves_the_value_in_even_if_the_old_one_panics() {
         let drops = Rc::new(Cell::new(0));
         let mut vec = Typed::new();
-        for id in 0..5 {
-            vec.push(Tracked::new(id, &drops));
-        }
-        vec.0.clear();
-        assert_eq!(drops.get(), 5);
-        assert_eq!(vec.len(), 0);
-
-        vec.push(Tracked::new(5, &drops));
-        assert_eq!(vec.get(0).id, 5);
-    }
-
-    #[test]
-    fn replace_survives_a_panicking_destructor() {
-        let drops = Rc::new(Cell::new(0));
-        let mut vec = Typed::new();
-        let mut bomb = Tracked::new(0, &drops);
-        bomb.panic_on_drop = true;
-        vec.push(bomb);
+        vec.push(Tracked::bomb(0, &drops));
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             vec.replace(0, Tracked::new(1, &drops));
@@ -439,9 +557,46 @@ mod tests {
     }
 
     #[test]
+    fn clear_drops_every_item_even_if_one_panics() {
+        let drops = Rc::new(Cell::new(0));
+        let mut vec = Typed::new();
+        for id in 0..5 {
+            vec.push(if id == 1 {
+                Tracked::bomb(id, &drops)
+            } else {
+                Tracked::new(id, &drops)
+            });
+        }
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| vec.0.clear()));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 5);
+        assert_eq!(vec.len(), 0);
+
+        vec.push(Tracked::new(5, &drops));
+        assert_eq!(vec.get(0).id, 5);
+    }
+
+    #[test]
+    fn dropping_frees_the_allocation_even_if_a_destructor_panics() {
+        // Miri reports a leak if the allocation is not freed.
+        let drops = Rc::new(Cell::new(0));
+        let mut vec = Typed::new();
+        vec.push(Tracked::new(0, &drops));
+        vec.push(Tracked::bomb(1, &drops));
+        vec.push(Tracked::new(2, &drops));
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| drop(vec)));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
     fn zero_sized_items() {
         static DROPS: AtomicUsize = AtomicUsize::new(0);
+
         struct Zst;
+
         impl Drop for Zst {
             fn drop(&mut self) {
                 DROPS.fetch_add(1, Ordering::Relaxed);
@@ -449,23 +604,26 @@ mod tests {
         }
 
         let mut vec = Typed::new();
+        let mut other = Typed::new();
         for _ in 0..1000 {
             vec.push(Zst);
         }
         vec.swap_remove_and_drop(500);
         vec.replace(0, Zst);
         drop(vec.swap_remove(0));
-        assert_eq!(vec.len(), 998);
+        vec.swap_remove_into(0, &mut other);
+        assert_eq!((vec.len(), other.len()), (997, 1));
         assert_eq!(DROPS.load(Ordering::Relaxed), 3);
 
         drop(vec);
+        drop(other);
         assert_eq!(DROPS.load(Ordering::Relaxed), 1001);
     }
 
     #[test]
     fn over_aligned_items() {
         #[repr(align(64))]
-        struct Aligned(u8);
+        struct Aligned(usize);
 
         let mut vec = Typed::new();
         for i in 0..20 {
@@ -473,18 +631,21 @@ mod tests {
         }
         for i in 0..20 {
             let item = vec.get(i);
-            assert_eq!((item as *const Aligned).addr() % 64, 0);
-            assert_eq!(item.0, i as u8);
+            assert_eq!(ptr::from_ref(item).addr() % 64, 0);
+            assert_eq!(item.0, i);
         }
     }
 
     #[test]
-    fn items_with_padding_survive_swaps() {
+    fn items_with_padding_survive_moves() {
         let mut vec = Typed::<(u8, u64)>::new();
+        let mut other = Typed::new();
         for i in 0..8 {
             vec.push((i, u64::from(i) << 40));
         }
         assert_eq!(vec.swap_remove(0), (0, 0));
         assert_eq!(*vec.get(0), (7, 7 << 40));
+        vec.swap_remove_into(1, &mut other);
+        assert_eq!(*other.get(0), (1, 1 << 40));
     }
 }

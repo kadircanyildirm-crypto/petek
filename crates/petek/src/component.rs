@@ -2,8 +2,8 @@
 
 use std::alloc::Layout;
 use std::any::{TypeId, type_name};
-use std::collections::HashMap;
 
+use crate::hash::FastHashMap;
 use crate::storage::blob_vec::{DropFn, drop_fn_of};
 
 /// Data that can be attached to an entity.
@@ -20,6 +20,17 @@ use crate::storage::blob_vec::{DropFn, drop_fn_of};
 ///
 /// impl Component for Position {}
 /// ```
+///
+/// Components must be `Send + Sync` so that worlds can be shared between
+/// threads. This does not compile, because `Rc` is neither:
+///
+/// ```compile_fail
+/// use std::rc::Rc;
+///
+/// struct Shared(Rc<u32>);
+///
+/// impl petek::Component for Shared {}
+/// ```
 pub trait Component: Send + Sync + 'static {}
 
 /// Identifies a component type within one world.
@@ -27,6 +38,11 @@ pub trait Component: Send + Sync + 'static {}
 pub(crate) struct ComponentId(u32);
 
 /// Type-erased description of a component type.
+///
+/// The only way to create one is [`ComponentInfo::of`], so it always describes
+/// an actual [`Component`]. Storage relies on this: columns are built from
+/// these descriptions, and may be shared between threads because components
+/// are `Send + Sync`.
 #[derive(Clone, Copy, Debug)]
 pub struct ComponentInfo {
     type_id: TypeId,
@@ -37,6 +53,7 @@ pub struct ComponentInfo {
 
 impl ComponentInfo {
     /// Describes the component type `C`.
+    #[must_use]
     pub fn of<C: Component>() -> Self {
         Self {
             type_id: TypeId::of::<C>(),
@@ -47,16 +64,19 @@ impl ComponentInfo {
     }
 
     /// The [`TypeId`] of the component type.
+    #[must_use]
     pub fn type_id(&self) -> TypeId {
         self.type_id
     }
 
     /// The name of the component type, for diagnostics only.
+    #[must_use]
     pub fn name(&self) -> &'static str {
         self.name
     }
 
     /// The memory layout of the component type.
+    #[must_use]
     pub fn layout(&self) -> Layout {
         self.layout
     }
@@ -70,7 +90,7 @@ impl ComponentInfo {
 #[derive(Default)]
 pub(crate) struct Components {
     infos: Vec<ComponentInfo>,
-    ids: HashMap<TypeId, ComponentId>,
+    ids: FastHashMap<TypeId, ComponentId>,
 }
 
 impl Components {
@@ -85,6 +105,7 @@ impl Components {
     }
 
     /// Returns the id of a component type, if it has been registered.
+    #[inline]
     pub(crate) fn id(&self, type_id: TypeId) -> Option<ComponentId> {
         self.ids.get(&type_id).copied()
     }

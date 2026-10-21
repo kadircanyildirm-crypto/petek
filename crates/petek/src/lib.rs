@@ -25,14 +25,17 @@
 //! let ball = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 2.0 }));
 //!
 //! // Components can be added and removed at any time.
-//! let velocity = world.remove::<Velocity>(ball).unwrap();
+//! let velocity = world.remove::<Velocity>(ball)?;
 //! let position = world.get_mut::<Position>(ball).unwrap();
 //! position.x += velocity.x;
 //! position.y += velocity.y;
 //!
 //! assert_eq!(world.get::<Position>(ball), Some(&Position { x: 1.0, y: 2.0 }));
-//! assert_eq!(world.get::<Velocity>(ball), None);
+//! assert!(!world.has::<Velocity>(ball));
+//! # Ok::<(), petek::RemoveError>(())
 //! ```
+//!
+//! `ARCHITECTURE.md` in the repository explains how the crate works inside.
 //!
 //! **Work in progress:** queries and systems are not implemented yet.
 
@@ -40,10 +43,16 @@ mod archetype;
 mod bundle;
 mod component;
 mod entity;
+mod hash;
 mod storage;
 mod world;
 
 pub use bundle::Bundle;
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
-pub use world::{NoSuchEntity, World};
+pub use world::{NoSuchEntity, RemoveError, SpawnBatch, World};
+
+// Checks that the examples in the README compile and run.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
