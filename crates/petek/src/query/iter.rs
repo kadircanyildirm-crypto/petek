@@ -9,26 +9,32 @@ use super::{QueryData, QueryFilter};
 use crate::archetype::{Archetype, ArchetypeId, Archetypes};
 
 /// The archetypes a query iterator has left to visit.
-pub(crate) enum Matched<'w> {
+pub(crate) enum Matched<'w, 's> {
     /// Archetypes that are each still to be checked against the query.
     Scan(slice::Iter<'w, Archetype>),
-    /// Archetypes already known to match the query.
-    Cached(&'w Archetypes, slice::Iter<'w, ArchetypeId>),
+    /// Archetypes already known to match the query, listed by a
+    /// [`QueryState`](super::QueryState).
+    Cached(&'w Archetypes, slice::Iter<'s, ArchetypeId>),
 }
 
 /// An iterator over the items of a query, one per matching entity.
 ///
-/// Entities are visited archetype by archetype, in no particular order.
-pub struct QueryIter<'w, D: QueryData, F: QueryFilter = ()> {
+/// Entities are visited archetype by archetype, in no particular order. The
+/// items borrow the world for `'w`; a [`QueryState`](super::QueryState) that
+/// the iterator came from is only borrowed for `'s`, while iterating.
+///
+/// The number of items left is known exactly, but computing it takes time
+/// proportional to the number of archetypes left.
+pub struct QueryIter<'w, 's, D: QueryData, F: QueryFilter = ()> {
     /// `None` if the query cannot match anything, because some of its
     /// components are not registered.
     state: Option<(D::State, F::State)>,
-    archetypes: Matched<'w>,
+    archetypes: Matched<'w, 's>,
     /// The archetype being visited, and its rows that are left.
     current: Option<(D::Fetch<'w>, Range<usize>)>,
 }
 
-impl<'w, D: QueryData, F: QueryFilter> QueryIter<'w, D, F> {
+impl<'w, 's, D: QueryData, F: QueryFilter> QueryIter<'w, 's, D, F> {
     /// Creates an iterator over the matching entities of `archetypes`.
     ///
     /// # Safety
@@ -39,7 +45,10 @@ impl<'w, D: QueryData, F: QueryFilter> QueryIter<'w, D, F> {
     /// - For `'w`, the caller must hold the access that `D` reports, and `D`
     ///   must not access any component mutably more than once (see
     ///   [`check_access`](super::check_access)).
-    pub(crate) unsafe fn new(state: Option<(D::State, F::State)>, archetypes: Matched<'w>) -> Self {
+    pub(crate) unsafe fn new(
+        state: Option<(D::State, F::State)>,
+        archetypes: Matched<'w, 's>,
+    ) -> Self {
         Self {
             state,
             archetypes,
@@ -69,7 +78,7 @@ impl<'w, D: QueryData, F: QueryFilter> QueryIter<'w, D, F> {
     }
 }
 
-impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
+impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, '_, D, F> {
     type Item = D::Item<'w>;
 
     #[inline]
@@ -130,9 +139,11 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     }
 }
 
-impl<D: QueryData, F: QueryFilter> FusedIterator for QueryIter<'_, D, F> {}
+impl<D: QueryData, F: QueryFilter> ExactSizeIterator for QueryIter<'_, '_, D, F> {}
 
-impl<D: QueryData, F: QueryFilter> fmt::Debug for QueryIter<'_, D, F> {
+impl<D: QueryData, F: QueryFilter> FusedIterator for QueryIter<'_, '_, D, F> {}
+
+impl<D: QueryData, F: QueryFilter> fmt::Debug for QueryIter<'_, '_, D, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryIter")
             .field("remaining", &self.size_hint().0)

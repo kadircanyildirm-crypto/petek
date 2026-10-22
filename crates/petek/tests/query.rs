@@ -372,3 +372,54 @@ fn query_states_reject_conflicting_access() {
     let mut world = World::new();
     let _ = QueryState::<(&mut Pos, Option<&Pos>)>::new(&mut world);
 }
+
+#[test]
+fn queries_can_move_to_other_threads() {
+    fn assert_send_sync<T: Send + Sync>(_: &T) {}
+
+    let (mut world, [_, b, ..]) = sample();
+    let query = world.query_mut::<(&mut Pos, Entity, Option<&Vel>)>();
+    assert_send_sync(&query);
+    let iter = query.into_iter();
+    assert_send_sync(&iter);
+
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            for (pos, _, vel) in iter {
+                pos.0 += vel.map_or(0, |vel| vel.0);
+            }
+        });
+    });
+    assert_eq!(world.get::<Pos>(b), Some(&Pos(22)));
+}
+
+#[test]
+fn borrowed_queries_can_be_used_again() {
+    let (mut world, [a, b, ..]) = sample();
+
+    let mut query = world.query_mut::<&mut Pos>();
+    for pos in &mut query {
+        pos.0 += 1;
+    }
+    query.iter_mut().for_each(|pos| pos.0 *= 2);
+    query.get_mut(a).unwrap().0 += 100;
+    assert_eq!(query.iter_mut().len(), 3);
+
+    let query = world.query::<&Pos>();
+    assert_eq!(query.iter().len(), 3);
+    assert_eq!((&query).into_iter().len(), 3);
+    assert_eq!(query.get(a), Ok(&Pos(104)));
+    assert_eq!(query.get(b), Ok(&Pos(6)));
+}
+
+#[test]
+fn query_state_items_only_borrow_the_world() {
+    let (mut world, [a, ..]) = sample();
+    let mut state = QueryState::<&Pos>::new(&mut world);
+
+    // The items of one run stay usable while the state runs again.
+    let first: Vec<&Pos> = state.iter(&world).collect();
+    let second: Vec<&Pos> = state.iter(&world).collect();
+    assert_eq!(first, second);
+    assert_eq!(state.get(&world, a), Ok(first[0]));
+}

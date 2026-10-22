@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn registration_is_cached_per_bundle_type() {
-        let mut components = Components::default();
+        let mut components = Components::new();
         let mut bundles = Bundles::default();
         let ab = bundles.register::<(A, B)>(&mut components);
         let ba = bundles.register::<(B, A)>(&mut components);
@@ -264,6 +264,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "more than once")]
     fn duplicate_components_are_rejected() {
-        Bundles::default().register::<(A, (C, A))>(&mut Components::default());
+        Bundles::default().register::<(A, (C, A))>(&mut Components::new());
     }
 }

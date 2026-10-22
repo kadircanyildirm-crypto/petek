@@ -86,7 +86,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     ///
     /// If `world` is not the world this state was created for.
     #[track_caller]
-    pub fn iter<'w>(&'w mut self, world: &'w World) -> QueryIter<'w, D, F>
+    pub fn iter<'w, 's>(&'s mut self, world: &'w World) -> QueryIter<'w, 's, D, F>
     where
         D: ReadOnlyQueryData,
     {
@@ -104,7 +104,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     ///
     /// If `world` is not the world this state was created for.
     #[track_caller]
-    pub fn iter_mut<'w>(&'w mut self, world: &'w mut World) -> QueryIter<'w, D, F> {
+    pub fn iter_mut<'w, 's>(&'s mut self, world: &'w mut World) -> QueryIter<'w, 's, D, F> {
         self.update(world);
         // SAFETY: as in `iter`, except that `D` may write: `new` checked that
         // it accesses no component mutably more than once, and `&mut World`
@@ -163,7 +163,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     /// `update` must have been called with `world` since it last changed
     /// structurally, and for `'w`, the caller must hold the access that `D`
     /// reports.
-    unsafe fn iter_unchecked<'w>(&'w self, world: &'w World) -> QueryIter<'w, D, F> {
+    unsafe fn iter_unchecked<'w, 's>(&'s self, world: &'w World) -> QueryIter<'w, 's, D, F> {
         let archetypes = Matched::Cached(world.archetypes(), self.matched.iter());
         // SAFETY: the states come from `world`, `matched` lists each matching
         // archetype once, and the caller holds the access.
@@ -176,12 +176,17 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     #[track_caller]
     fn update(&mut self, world: &World) {
         self.check_world(world);
-        for (id, archetype) in world.archetypes().iter_from(self.checked) {
+        // Reserving first means that pushing cannot panic halfway, which
+        // would leave archetypes listed but not counted as checked, and so
+        // listed twice after the next update.
+        let archetypes = world.archetypes();
+        self.matched.reserve(archetypes.len() - self.checked);
+        for (id, archetype) in archetypes.iter_from(self.checked) {
             if D::matches(&self.data, archetype) && F::matches(&self.filter, archetype) {
                 self.matched.push(id);
             }
         }
-        self.checked = world.archetypes().len();
+        self.checked = archetypes.len();
     }
 
     /// Panics if `world` is not the world this state was created for, whose

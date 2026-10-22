@@ -87,13 +87,23 @@ impl ComponentInfo {
 }
 
 /// Assigns a [`ComponentId`] to each component type a world encounters.
-#[derive(Default, Debug)]
+///
+/// This is only `pub` because the hidden methods of the query traits mention
+/// it. It deliberately has no public constructor.
+#[derive(Debug)]
 pub struct Components {
     infos: Vec<ComponentInfo>,
     ids: FastHashMap<TypeId, ComponentId>,
 }
 
 impl Components {
+    pub(crate) fn new() -> Self {
+        Self {
+            infos: Vec::new(),
+            ids: FastHashMap::default(),
+        }
+    }
+
     /// Returns the id of the described component type, registering it on
     /// first use.
     pub(crate) fn register(&mut self, info: ComponentInfo) -> ComponentId {
@@ -139,7 +149,7 @@ mod tests {
 
     #[test]
     fn each_type_is_registered_once() {
-        let mut components = Components::default();
+        let mut components = Components::new();
         let position = components.register(ComponentInfo::of::<Position>());
         let name = components.register(ComponentInfo::of::<Name>());
 

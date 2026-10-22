@@ -96,7 +96,11 @@ mod sealed {
 /// [`filter`](Self::filter), or look up a single entity with
 /// [`get`](Self::get).
 ///
-/// A query that only reads is `Copy`, so it can be used any number of times.
+/// Iterating with `for` and [`get`](Self::get) consume the query, so that the
+/// items can live as long as the borrow of the world.
+/// [`iter_mut`](Self::iter_mut) and [`get_mut`](Self::get_mut) borrow it
+/// instead, so it can be used again once their items are gone. A query that
+/// only reads is `Copy`, and can be used any number of times anyway.
 pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     world: &'w World,
     /// `None` if some of `D`'s components are not registered, so that nothing
@@ -189,17 +193,100 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             _ => Err(QueryError::DoesNotMatch(entity)),
         }
     }
+
+    /// Iterates over the items of every matching entity, borrowing the query
+    /// rather than consuming it.
+    pub fn iter_mut(&mut self) -> QueryIter<'_, '_, D, F> {
+        self.reborrow().into_iter()
+    }
+
+    /// Returns the item of `entity`, borrowing the query rather than consuming
+    /// it, so that several entities can be looked up one after another.
+    ///
+    /// ```
+    /// # use petek::{Component, World};
+    /// # struct Health(u32);
+    /// # impl Component for Health {}
+    /// let mut world = World::new();
+    /// let (a, b) = (world.spawn(Health(10)), world.spawn(Health(20)));
+    ///
+    /// let mut health = world.query_mut::<&mut Health>();
+    /// let stolen = std::mem::take(&mut health.get_mut(a)?.0);
+    /// health.get_mut(b)?.0 += stolen;
+    /// # assert_eq!(world.get::<Health>(b).unwrap().0, 30);
+    /// # Ok::<(), petek::query::QueryError>(())
+    /// ```
+    ///
+    /// The item borrows the query, so two items cannot be held at once, as
+    /// they would alias if both belonged to the same entity:
+    ///
+    /// ```compile_fail,E0499
+    /// # use petek::{Component, World};
+    /// # struct Health(u32);
+    /// # impl Component for Health {}
+    /// let mut world = World::new();
+    /// let a = world.spawn(Health(10));
+    ///
+    /// let mut health = world.query_mut::<&mut Health>();
+    /// let first = health.get_mut(a)?;
+    /// let second = health.get_mut(a)?;
+    /// first.0 += second.0;
+    /// # Ok::<(), petek::query::QueryError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As for [`get`](Self::get).
+    pub fn get_mut(&mut self, entity: Entity) -> Result<D::Item<'_>, QueryError> {
+        self.reborrow().get(entity)
+    }
+
+    /// Returns a copy of this query that borrows it mutably, so that the two
+    /// cannot be used at the same time.
+    fn reborrow(&mut self) -> Query<'_, D, F> {
+        Query {
+            world: self.world,
+            data: self.data,
+            filter: self.filter,
+        }
+    }
+}
+
+impl<'w, D: ReadOnlyQueryData, F: QueryFilter> Query<'w, D, F> {
+    /// Iterates over the items of every matching entity.
+    #[must_use]
+    pub fn iter(&self) -> QueryIter<'w, 'w, D, F> {
+        (*self).into_iter()
+    }
 }
 
 impl<'w, D: QueryData, F: QueryFilter> IntoIterator for Query<'w, D, F> {
     type Item = D::Item<'w>;
-    type IntoIter = QueryIter<'w, D, F>;
+    type IntoIter = QueryIter<'w, 'w, D, F>;
 
     fn into_iter(self) -> Self::IntoIter {
         let state = self.data.map(|data| (data, self.filter));
         // SAFETY: the state comes from the world whose archetypes are scanned,
         // and `new`'s caller holds the access.
         unsafe { QueryIter::new(state, Matched::Scan(self.world.archetypes().iter())) }
+    }
+}
+
+impl<'a, D: QueryData, F: QueryFilter> IntoIterator for &'a mut Query<'_, D, F> {
+    type Item = D::Item<'a>;
+    type IntoIter = QueryIter<'a, 'a, D, F>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<'w, D: ReadOnlyQueryData, F: QueryFilter> IntoIterator for &Query<'w, D, F> {
+    type Item = D::Item<'w>;
+    type IntoIter = QueryIter<'w, 'w, D, F>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 

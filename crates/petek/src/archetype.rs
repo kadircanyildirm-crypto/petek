@@ -397,7 +397,7 @@ pub(crate) struct Archetypes {
 impl Archetypes {
     /// Creates the collection with just the empty archetype.
     pub(crate) fn new() -> Self {
-        let empty = Archetype::new(Box::default(), &Components::default());
+        let empty = Archetype::new(Box::default(), &Components::new());
         Self {
             by_id: vec![empty],
             by_components: [(Box::default(), ArchetypeId::EMPTY)].into_iter().collect(),
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn transitions_are_computed_once_and_cached() {
-        let (mut components, mut bundles) = (Components::default(), Bundles::default());
+        let (mut components, mut bundles) = (Components::new(), Bundles::default());
         let mut archetypes = Archetypes::new();
         let (ab, ab_ids) = ids_of::<(A, B)>(&mut bundles, &mut components);
         let (cb, cb_ids) = ids_of::<(C, B)>(&mut bundles, &mut components);

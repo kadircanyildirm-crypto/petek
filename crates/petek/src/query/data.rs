@@ -118,17 +118,44 @@ pub enum Access {
     Write,
 }
 
-/// Returns a pointer to the first item of `archetype`'s column for component
-/// `id`.
+/// A pointer to the first item of a column of `T`s, from which a query fetches
+/// `&T` or `&mut T` items.
 ///
-/// # Panics
-///
-/// If the archetype has no such column.
-fn column_start<T>(id: ComponentId, archetype: &Archetype) -> NonNull<T> {
-    let column = archetype
-        .column_index(id)
-        .expect("the archetype has the component");
-    archetype.column(column).as_ptr().cast()
+/// Unlike a raw pointer, it is `Send` and `Sync`, so that query iterators are
+/// too. That is sound because the pointer alone grants nothing: only the
+/// items made from it can be used, and they are references to components,
+/// which are always `Send + Sync`.
+#[derive(Debug)]
+pub struct ColumnStart<T>(NonNull<T>);
+
+// SAFETY: see the type's documentation.
+unsafe impl<T: Component> Send for ColumnStart<T> {}
+// SAFETY: see the type's documentation.
+unsafe impl<T: Component> Sync for ColumnStart<T> {}
+
+impl<T> ColumnStart<T> {
+    /// Returns the start of `archetype`'s column for component `id`.
+    ///
+    /// # Panics
+    ///
+    /// If the archetype has no such column.
+    fn of(id: ComponentId, archetype: &Archetype) -> Self {
+        let column = archetype
+            .column_index(id)
+            .expect("the archetype has the component");
+        Self(archetype.column(column).as_ptr().cast())
+    }
+
+    /// Returns a pointer to the item at `row`.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be in bounds of the column.
+    #[inline]
+    unsafe fn row(&self, row: usize) -> NonNull<T> {
+        // SAFETY: the caller guarantees the offset stays within the column.
+        unsafe { self.0.add(row) }
+    }
 }
 
 impl<T: Component> sealed::Data for &T {}
@@ -138,7 +165,7 @@ impl<T: Component> ReadOnlyQueryData for &T {}
 impl<T: Component> QueryData for &T {
     type Item<'w> = &'w T;
     type State = ComponentId;
-    type Fetch<'w> = NonNull<T>;
+    type Fetch<'w> = ColumnStart<T>;
 
     fn init_state(components: &mut Components) -> ComponentId {
         components.register(ComponentInfo::of::<T>())
@@ -159,14 +186,14 @@ impl<T: Component> QueryData for &T {
     unsafe fn fetch<'w>(&id: &ComponentId, archetype: &'w Archetype) -> Self::Fetch<'w> {
         // The caller guarantees `id` is `T`'s id in this world, so the column
         // stores `T`s.
-        column_start(id, archetype)
+        ColumnStart::of(id, archetype)
     }
 
     #[inline]
     unsafe fn item<'w>(start: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
         // SAFETY: the caller guarantees `row` is in bounds of the column, so
         // it holds a valid `T`, and that nothing writes it for `'w`.
-        unsafe { start.add(row).as_ref() }
+        unsafe { start.row(row).as_ref() }
     }
 }
 
@@ -175,7 +202,7 @@ impl<T: Component> sealed::Data for &mut T {}
 impl<T: Component> QueryData for &mut T {
     type Item<'w> = &'w mut T;
     type State = ComponentId;
-    type Fetch<'w> = NonNull<T>;
+    type Fetch<'w> = ColumnStart<T>;
 
     fn init_state(components: &mut Components) -> ComponentId {
         components.register(ComponentInfo::of::<T>())
@@ -195,14 +222,14 @@ impl<T: Component> QueryData for &mut T {
 
     unsafe fn fetch<'w>(&id: &ComponentId, archetype: &'w Archetype) -> Self::Fetch<'w> {
         // As for `&T`.
-        column_start(id, archetype)
+        ColumnStart::of(id, archetype)
     }
 
     #[inline]
     unsafe fn item<'w>(start: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
         // SAFETY: the caller guarantees `row` is in bounds of the column, so
         // it holds a valid `T`, and that nothing else accesses it for `'w`.
-        unsafe { start.add(row).as_mut() }
+        unsafe { start.row(row).as_mut() }
     }
 }
 
