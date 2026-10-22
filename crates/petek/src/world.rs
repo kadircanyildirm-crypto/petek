@@ -11,6 +11,7 @@ use crate::bundle::{Bundle, Bundles};
 use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
 use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
+use crate::resource::{Resource, Resources};
 
 /// Stores entities and their components.
 ///
@@ -34,6 +35,7 @@ pub struct World {
     components: Components,
     bundles: Bundles,
     archetypes: Archetypes,
+    resources: Resources,
 }
 
 /// Uniquely identifies a world, so that state computed for one world, such as
@@ -71,6 +73,7 @@ impl World {
             components: Components::new(),
             bundles: Bundles::default(),
             archetypes: Archetypes::new(),
+            resources: Resources::default(),
         }
     }
 
@@ -428,11 +431,52 @@ impl World {
 
     /// Despawns every entity, dropping all components.
     ///
-    /// Component types and archetypes stay registered and keep their storage,
-    /// so refilling the world is cheap.
+    /// Resources are kept. Component types and archetypes stay registered and
+    /// keep their storage, so refilling the world is cheap.
     pub fn clear(&mut self) {
         self.entities.clear();
         self.archetypes.clear_entities();
+    }
+
+    /// Inserts a resource, returning the previous resource of the same type,
+    /// if any.
+    ///
+    /// ```
+    /// # use petek::{Resource, World};
+    /// #[derive(Debug, PartialEq)]
+    /// struct Score(u32);
+    /// impl Resource for Score {}
+    ///
+    /// let mut world = World::new();
+    /// assert_eq!(world.insert_resource(Score(1)), None);
+    /// assert_eq!(world.insert_resource(Score(2)), Some(Score(1)));
+    /// ```
+    pub fn insert_resource<R: Resource>(&mut self, resource: R) -> Option<R> {
+        self.resources.insert(resource)
+    }
+
+    /// Removes the resource of type `R` and returns it, if there is one.
+    pub fn remove_resource<R: Resource>(&mut self) -> Option<R> {
+        self.resources.remove()
+    }
+
+    /// Returns `true` if the world holds a resource of type `R`.
+    #[must_use]
+    pub fn contains_resource<R: Resource>(&self) -> bool {
+        self.resource::<R>().is_some()
+    }
+
+    /// Returns a reference to the resource of type `R`, if there is one.
+    #[must_use]
+    pub fn resource<R: Resource>(&self) -> Option<&R> {
+        self.resources.get()
+    }
+
+    /// Returns a mutable reference to the resource of type `R`, if there is
+    /// one.
+    #[must_use]
+    pub fn resource_mut<R: Resource>(&mut self) -> Option<&mut R> {
+        self.resources.get_mut()
     }
 
     #[inline]
@@ -523,6 +567,7 @@ impl fmt::Debug for World {
         f.debug_struct("World")
             .field("entities", &self.len())
             .field("archetypes", &self.archetypes.len())
+            .field("resources", &self.resources.len())
             .finish_non_exhaustive()
     }
 }

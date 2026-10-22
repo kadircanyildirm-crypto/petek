@@ -60,12 +60,14 @@ mod component;
 mod entity;
 mod hash;
 pub mod query;
+mod resource;
 mod storage;
 mod world;
 
 pub use bundle::Bundle;
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
+pub use resource::Resource;
 pub use world::{NoSuchEntity, RemoveError, SpawnBatch, World};
 
 // Checks that the examples in the README compile and run.
