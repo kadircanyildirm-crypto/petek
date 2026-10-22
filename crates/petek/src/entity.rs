@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use crate::archetype::ArchetypeId;
 
@@ -92,12 +93,25 @@ pub(crate) struct EntityLocation {
 }
 
 /// Allocates entity handles and tracks where each alive entity is stored.
+///
+/// Entities can also be *reserved* through a shared reference, which lets
+/// code that cannot change the world, such as commands recorded during a
+/// query, hand out entities that will exist later. Reserved entities become
+/// alive when the world [flushes](Self::flush) them, which it does before any
+/// other change to its entities.
 #[derive(Default)]
 pub(crate) struct Entities {
     meta: Vec<EntityMeta>,
-    /// Indices of free slots, ready to be reused.
+    /// Indices of free slots, ready to be reused. Slots are taken from the
+    /// end.
     free: Vec<u32>,
-    /// Number of alive entities.
+    /// How many slots of `free` have not been reserved, counting down as
+    /// reservations take them from the end. Once it is zero, each further
+    /// step below zero reserves a brand-new slot past the end of `meta`.
+    ///
+    /// Equal to `free.len()` while no reservations are pending.
+    unreserved: AtomicIsize,
+    /// Number of alive entities, not counting pending reservations.
     len: usize,
 }
 
@@ -130,7 +144,10 @@ impl EntityMeta {
 impl Entities {
     /// Allocates a new entity stored at `location`, reusing a free slot if
     /// there is one.
+    ///
+    /// No reservations may be pending.
     pub(crate) fn alloc(&mut self, location: EntityLocation) -> Entity {
+        debug_assert_eq!(self.pending(), 0, "reserved entities must be flushed first");
         let entity = if let Some(index) = self.free.pop() {
             let meta = &mut self.meta[index as usize];
             meta.location = Some(location);
@@ -144,30 +161,107 @@ impl Entities {
             Entity::new(index, NonZeroU32::MIN)
         };
         self.len += 1;
+        self.sync_unreserved();
         entity
     }
 
     /// Frees `entity` so its slot can be reused, returning where it was
     /// stored.
     ///
-    /// Returns `None`, and does nothing, if `entity` was not alive.
+    /// Returns `None`, and does nothing, if `entity` was not alive. No
+    /// reservations may be pending.
     pub(crate) fn free(&mut self, entity: Entity) -> Option<EntityLocation> {
+        debug_assert_eq!(self.pending(), 0, "reserved entities must be flushed first");
         let location = self.get(entity)?;
         if self.meta[entity.index as usize].release() {
             self.free.push(entity.index);
         }
         self.len -= 1;
+        self.sync_unreserved();
         Some(location)
     }
 
-    /// Frees every alive entity.
+    /// Frees every alive entity. No reservations may be pending.
     pub(crate) fn clear(&mut self) {
+        debug_assert_eq!(self.pending(), 0, "reserved entities must be flushed first");
         for (index, meta) in (0..).zip(&mut self.meta) {
             if meta.location.is_some() && meta.release() {
                 self.free.push(index);
             }
         }
         self.len = 0;
+        self.sync_unreserved();
+    }
+
+    /// Reserves an entity, which becomes alive at the next
+    /// [`flush`](Self::flush).
+    ///
+    /// This only needs a shared reference, and can be called from several
+    /// threads at once. Reservations made in the same order get the same
+    /// entities.
+    ///
+    /// # Panics
+    ///
+    /// If there are no entities left to hand out.
+    pub(crate) fn reserve(&self) -> Entity {
+        // Each caller gets a different `n`. `free` and `meta` cannot change
+        // while `&self` is held, so no stronger ordering is needed.
+        let n = self.unreserved.fetch_sub(1, Ordering::Relaxed);
+        if n > 0 {
+            let index = self.free[n.unsigned_abs() - 1];
+            Entity::new(index, self.meta[index as usize].generation)
+        } else {
+            let index = self.meta.len() + n.unsigned_abs();
+            let index = u32::try_from(index).expect("too many entities");
+            Entity::new(index, NonZeroU32::MIN)
+        }
+    }
+
+    /// The number of reserved entities that are not alive yet.
+    pub(crate) fn pending(&mut self) -> usize {
+        let unreserved = *self.unreserved.get_mut();
+        self.free
+            .len()
+            .checked_add_signed(-unreserved)
+            .expect("reservations are counted from `free`")
+    }
+
+    /// Makes every reserved entity alive, in the order they were reserved,
+    /// stored where `place` puts it.
+    ///
+    /// `place` must not panic, or some reserved entities may never become
+    /// alive. That would not be unsound, but their handles would be useless.
+    ///
+    /// # Panics
+    ///
+    /// If there are no entities left to hand out.
+    pub(crate) fn flush(&mut self, mut place: impl FnMut(Entity) -> EntityLocation) {
+        let unreserved = *self.unreserved.get_mut();
+        // Reservations took the free slots from the end, and then new slots.
+        let reused = self.free.len().min(unreserved.max(0).unsigned_abs());
+        for index in self.free.drain(reused..).rev() {
+            let meta = &mut self.meta[index as usize];
+            let entity = Entity::new(index, meta.generation);
+            meta.location = Some(place(entity));
+            self.len += 1;
+        }
+        for _ in 0..unreserved.min(0).unsigned_abs() {
+            let index = u32::try_from(self.meta.len()).expect("too many entities");
+            let entity = Entity::new(index, NonZeroU32::MIN);
+            let location = place(entity);
+            self.meta.push(EntityMeta {
+                generation: NonZeroU32::MIN,
+                location: Some(location),
+            });
+            self.len += 1;
+        }
+        self.sync_unreserved();
+    }
+
+    /// Marks every free slot as unreserved again, after `free` has changed.
+    fn sync_unreserved(&mut self) {
+        *self.unreserved.get_mut() =
+            isize::try_from(self.free.len()).expect("free slots fit in memory");
     }
 
     /// Returns where `entity` is stored, or `None` if it is not alive.
@@ -314,5 +408,88 @@ mod tests {
         assert_eq!(reused.map(Entity::index), [a.index(), b.index()]);
         assert!(reused.iter().all(|entity| entity.generation() == 2));
         assert_eq!(entities.alloc(HERE).index(), 2);
+    }
+
+    /// Flushes the reservations, recording each placed entity.
+    fn flush(entities: &mut Entities) -> Vec<Entity> {
+        let mut placed = Vec::new();
+        entities.flush(|entity| {
+            placed.push(entity);
+            HERE
+        });
+        placed
+    }
+
+    #[test]
+    fn reservations_reuse_free_slots_then_add_new_ones() {
+        let mut entities = Entities::default();
+        let [a, b, c] = [(); 3].map(|()| entities.alloc(HERE));
+        entities.free(a);
+        entities.free(c);
+
+        // Free slots are taken from the end of the free list, like `alloc`.
+        let reserved = [(); 3].map(|()| entities.reserve());
+        assert_eq!(reserved.map(Entity::index), [c.index(), a.index(), 3]);
+        assert_eq!(reserved.map(Entity::generation), [2, 2, 1]);
+        assert!(reserved.iter().all(|&entity| !entities.contains(entity)));
+        assert_eq!(entities.pending(), 3);
+
+        assert_eq!(flush(&mut entities), reserved);
+        assert!(reserved.iter().all(|&entity| entities.contains(entity)));
+        assert!(entities.contains(b));
+        assert_eq!(entities.len(), 4);
+        assert_eq!(entities.pending(), 0);
+        assert!(flush(&mut entities).is_empty());
+
+        // Allocation carries on where the reservations left off.
+        assert_eq!(entities.alloc(HERE).index(), 4);
+    }
+
+    #[test]
+    fn reservations_are_deterministic() {
+        let history = || {
+            let mut entities = Entities::default();
+            let all: Vec<_> = (0..8).map(|_| entities.alloc(HERE)).collect();
+            for &entity in all.iter().step_by(3) {
+                entities.free(entity);
+            }
+            let reserved: Vec<_> = (0..5).map(|_| entities.reserve()).collect();
+            (reserved, flush(&mut entities))
+        };
+        assert_eq!(history(), history());
+    }
+
+    #[test]
+    fn concurrent_reservations_are_distinct() {
+        let mut entities = Entities::default();
+        let all: Vec<_> = (0..50).map(|_| entities.alloc(HERE)).collect();
+        for &entity in &all[..25] {
+            entities.free(entity);
+        }
+
+        let per_thread = if cfg!(miri) { 10 } else { 1000 };
+        let mut reserved: Vec<Entity> = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..per_thread)
+                            .map(|_| entities.reserve())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().unwrap())
+                .collect()
+        });
+        reserved.sort();
+        reserved.dedup();
+        assert_eq!(reserved.len(), 4 * per_thread);
+
+        let mut placed = flush(&mut entities);
+        placed.sort();
+        assert_eq!(placed, reserved);
+        assert_eq!(entities.len(), 25 + 4 * per_thread);
     }
 }

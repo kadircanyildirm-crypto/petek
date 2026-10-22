@@ -56,6 +56,7 @@
 
 mod archetype;
 mod bundle;
+pub mod command;
 mod component;
 mod entity;
 mod hash;

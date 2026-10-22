@@ -164,6 +164,7 @@ impl World {
     ///
     /// Returns [`NoSuchEntity`] if `entity` is not alive.
     pub fn despawn(&mut self, entity: Entity) -> Result<(), NoSuchEntity> {
+        self.flush();
         let location = self.entities.free(entity).ok_or(NoSuchEntity(entity))?;
         let archetype = self.archetypes.get_mut(location.archetype);
         let row = location.row as usize;
@@ -207,6 +208,7 @@ impl World {
     /// If the bundle contains the same component more than once.
     #[track_caller]
     pub fn insert<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), NoSuchEntity> {
+        self.flush();
         let location = self.entities.get(entity).ok_or(NoSuchEntity(entity))?;
         let bundle_id = self.bundles.register::<B>(&mut self.components);
         let transition = self.archetypes.insert_transition(
@@ -288,6 +290,7 @@ impl World {
     /// If the bundle contains the same component more than once.
     #[track_caller]
     pub fn remove<B: Bundle>(&mut self, entity: Entity) -> Result<B, RemoveError> {
+        self.flush();
         let location = self.entities.get(entity).ok_or(NoSuchEntity(entity))?;
         let bundle_id = self.bundles.register::<B>(&mut self.components);
         let component_ids = &self.bundles.info(bundle_id).component_ids;
@@ -434,6 +437,7 @@ impl World {
     /// Resources are kept. Component types and archetypes stay registered and
     /// keep their storage, so refilling the world is cheap.
     pub fn clear(&mut self) {
+        self.flush();
         self.entities.clear();
         self.archetypes.clear_entities();
     }
@@ -477,6 +481,39 @@ impl World {
     #[must_use]
     pub fn resource_mut<R: Resource>(&mut self) -> Option<&mut R> {
         self.resources.get_mut()
+    }
+
+    /// Reserves an entity, which becomes alive, without components, at the
+    /// next structural change. See [`Entities::reserve`].
+    #[inline]
+    pub(crate) fn reserve_entity(&self) -> Entity {
+        self.entities.reserve()
+    }
+
+    /// Makes reserved entities alive, without components, in the order they
+    /// were reserved.
+    pub(crate) fn flush(&mut self) {
+        let pending = self.entities.pending();
+        if pending == 0 {
+            return;
+        }
+        let empty = self.archetypes.get_mut(ArchetypeId::EMPTY);
+        // Checking and reserving up front keeps the placement from panicking.
+        assert!(
+            u32::try_from(empty.len() + pending).is_ok(),
+            "too many entities in one archetype",
+        );
+        empty.reserve(pending);
+        self.entities.flush(|entity| {
+            let row = u32::try_from(empty.len()).expect("checked above");
+            // SAFETY: the empty archetype has no columns, so the entity alone
+            // completes its row.
+            unsafe { empty.push_entity(entity) };
+            EntityLocation {
+                archetype: ArchetypeId::EMPTY,
+                row,
+            }
+        });
     }
 
     #[inline]
@@ -523,6 +560,7 @@ impl World {
     /// `transition` must be the result of
     /// [`spawn_transition::<B>`](Self::spawn_transition).
     unsafe fn spawn_with<B: Bundle>(&mut self, transition: TransitionId, bundle: B) -> Entity {
+        self.flush();
         let (transition, empty, target) = self.archetypes.split(transition);
         let archetype = target.unwrap_or(empty);
         archetype.reserve(1);
