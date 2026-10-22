@@ -35,7 +35,7 @@ pub trait Component: Send + Sync + 'static {}
 
 /// Identifies a component type within one world.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub(crate) struct ComponentId(u32);
+pub struct ComponentId(u32);
 
 /// Type-erased description of a component type.
 ///
@@ -87,8 +87,8 @@ impl ComponentInfo {
 }
 
 /// Assigns a [`ComponentId`] to each component type a world encounters.
-#[derive(Default)]
-pub(crate) struct Components {
+#[derive(Default, Debug)]
+pub struct Components {
     infos: Vec<ComponentInfo>,
     ids: FastHashMap<TypeId, ComponentId>,
 }

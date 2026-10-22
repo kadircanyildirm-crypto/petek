@@ -9,6 +9,7 @@ use crate::archetype::{ArchetypeId, Archetypes, TransitionId};
 use crate::bundle::{Bundle, Bundles};
 use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
+use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
 
 /// Stores entities and their components.
 ///
@@ -338,6 +339,65 @@ impl World {
         Some(unsafe { column.get_unchecked_mut(row).cast::<T>().as_mut() })
     }
 
+    /// Returns a query that reads the components in `D` of every entity that
+    /// has them.
+    ///
+    /// Any number of read-only queries can be used at the same time. See the
+    /// [`query`](crate::query) module for what `D` can be, and how to filter
+    /// the query further.
+    ///
+    /// ```
+    /// # use petek::{Component, World};
+    /// # struct Health(u32);
+    /// # impl Component for Health {}
+    /// let mut world = World::new();
+    /// world.spawn_batch([Health(10), Health(20)]);
+    ///
+    /// let total: u32 = world.query::<&Health>().into_iter().map(|health| health.0).sum();
+    /// assert_eq!(total, 30);
+    /// ```
+    #[must_use]
+    pub fn query<D: ReadOnlyQueryData>(&self) -> Query<'_, D> {
+        let data = D::get_state(&self.components);
+        // SAFETY: the state comes from this world, `D` only reads, and `&self`
+        // rules out writes for the query's lifetime.
+        unsafe { Query::new(self, data) }
+    }
+
+    /// Returns a query that reads or writes the components in `D` of every
+    /// entity that has them.
+    ///
+    /// ```
+    /// # use petek::{Component, World};
+    /// # struct Position(f32);
+    /// # impl Component for Position {}
+    /// # struct Velocity(f32);
+    /// # impl Component for Velocity {}
+    /// let mut world = World::new();
+    /// let ball = world.spawn((Position(0.0), Velocity(2.0)));
+    ///
+    /// for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+    ///     position.0 += velocity.0;
+    /// }
+    /// assert_eq!(world.get::<Position>(ball).unwrap().0, 2.0);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `D` accesses a component mutably and also elsewhere, such as
+    /// `(&mut Position, &Position)`, since that would alias a mutable
+    /// reference.
+    #[must_use]
+    #[track_caller]
+    pub fn query_mut<D: QueryData>(&mut self) -> Query<'_, D> {
+        let data = D::init_state(&mut self.components);
+        check_access::<D>(&data, &self.components);
+        // SAFETY: the state comes from this world, `D` accesses no component
+        // mutably more than once, and `&mut self` gives the query exclusive
+        // access to the world for its lifetime.
+        unsafe { Query::new(self, Some(data)) }
+    }
+
     /// Despawns every entity, dropping all components.
     ///
     /// Component types and archetypes stay registered and keep their storage,
@@ -345,6 +405,21 @@ impl World {
     pub fn clear(&mut self) {
         self.entities.clear();
         self.archetypes.clear_entities();
+    }
+
+    #[inline]
+    pub(crate) fn entities(&self) -> &Entities {
+        &self.entities
+    }
+
+    #[inline]
+    pub(crate) fn components(&self) -> &Components {
+        &self.components
+    }
+
+    #[inline]
+    pub(crate) fn archetypes(&self) -> &Archetypes {
+        &self.archetypes
     }
 
     /// Returns the transition that spawns entities with a `B`.

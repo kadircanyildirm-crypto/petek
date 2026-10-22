@@ -138,6 +138,17 @@ impl BlobVec {
         self.len += 1;
     }
 
+    /// Returns a pointer to the first item.
+    ///
+    /// The pointer stays valid until the vector grows or is dropped. Writing
+    /// through it does not need `&mut self`, because a reference to the
+    /// vector only covers its header, not the items; the caller must make
+    /// sure no one else is accessing those items instead.
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> NonNull<u8> {
+        self.data
+    }
+
     /// Returns a pointer to the item at `index`, for reading.
     ///
     /// # Safety

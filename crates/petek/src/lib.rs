@@ -35,15 +35,31 @@
 //! # Ok::<(), petek::RemoveError>(())
 //! ```
 //!
+//! [Queries](query) visit every entity that has a given set of components:
+//!
+//! ```
+//! # use petek::{Component, World};
+//! # struct Position { x: f32, y: f32 }
+//! # impl Component for Position {}
+//! # struct Velocity { x: f32, y: f32 }
+//! # impl Component for Velocity {}
+//! # let mut world = World::new();
+//! for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+//!     position.x += velocity.x;
+//!     position.y += velocity.y;
+//! }
+//! ```
+//!
 //! `ARCHITECTURE.md` in the repository explains how the crate works inside.
 //!
-//! **Work in progress:** queries and systems are not implemented yet.
+//! **Work in progress:** systems are not implemented yet.
 
 mod archetype;
 mod bundle;
 mod component;
 mod entity;
 mod hash;
+pub mod query;
 mod storage;
 mod world;
 

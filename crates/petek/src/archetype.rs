@@ -1,6 +1,7 @@
 //! Archetypes: tables that store every entity with exactly the same set of
 //! components, and the cached transitions between them.
 
+use std::fmt;
 use std::ptr::NonNull;
 use std::slice;
 
@@ -32,7 +33,7 @@ impl ArchetypeId {
 ///
 /// Every column holds exactly one item per entity. Structural changes break
 /// this briefly, but restore it before any user code can run.
-pub(crate) struct Archetype {
+pub struct Archetype {
     /// The components of this archetype, sorted.
     component_ids: Box<[ComponentId]>,
     /// One column per component, in the same order as `component_ids`.
@@ -75,6 +76,18 @@ impl Archetype {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.entities.len()
+    }
+
+    /// The entity in each row.
+    #[inline]
+    pub(crate) fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
+
+    /// Returns `true` if this archetype has component `id`.
+    #[inline]
+    pub(crate) fn contains(&self, id: ComponentId) -> bool {
+        self.column_index(id).is_some()
     }
 
     /// The index of the column that stores component `id`, if there is one.
@@ -340,6 +353,15 @@ impl Archetype {
     }
 }
 
+impl fmt::Debug for Archetype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Archetype")
+            .field("component_ids", &self.component_ids)
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Identifies a cached [`Transition`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct TransitionId(u32);
@@ -385,6 +407,12 @@ impl Archetypes {
 
     pub(crate) fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// Iterates over all archetypes, in order of their ids.
+    #[inline]
+    pub(crate) fn iter(&self) -> slice::Iter<'_, Archetype> {
+        self.by_id.iter()
     }
 
     #[inline]

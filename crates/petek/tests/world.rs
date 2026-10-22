@@ -186,27 +186,48 @@ fn forged_and_stale_handles_are_rejected() {
     assert_eq!(world.get::<Pos>(entity), Some(&Pos(0)));
 }
 
+/// The components the model expects an entity to have.
+#[derive(Default)]
+struct Expected {
+    pos: Option<Pos>,
+    vel: Option<Vel>,
+    name: Option<Name>,
+}
+
+/// Checks the world against the model.
+fn check(world: &World, alive: &[(Entity, Expected)], dead: &[Entity]) {
+    assert_eq!(world.len(), alive.len());
+    for (entity, expected) in alive {
+        assert_eq!(world.get::<Pos>(*entity), expected.pos.as_ref());
+        assert_eq!(world.get::<Vel>(*entity), expected.vel.as_ref());
+        assert_eq!(world.get::<Name>(*entity), expected.name.as_ref());
+    }
+    assert!(dead.iter().all(|&entity| !world.contains(entity)));
+
+    // A query visits every entity that has the components exactly once.
+    let mut queried: Vec<_> = world
+        .query::<(Entity, &Pos, Option<&Name>)>()
+        .without::<Vel>()
+        .into_iter()
+        .map(|(entity, pos, name)| (entity, pos.0, name.cloned()))
+        .collect();
+    queried.sort_by_key(|&(entity, ..)| entity);
+    let mut expected: Vec<_> = alive
+        .iter()
+        .filter(|(_, expected)| expected.vel.is_none())
+        .filter_map(|(entity, expected)| {
+            let pos = expected.pos.as_ref()?;
+            Some((*entity, pos.0, expected.name.clone()))
+        })
+        .collect();
+    expected.sort_by_key(|&(entity, ..)| entity);
+    assert_eq!(queried, expected);
+}
+
 /// Applies a reproducible pseudo-random mix of operations and checks the
 /// world against a straightforward model after every batch of them.
 #[test]
 fn matches_a_model_under_random_operations() {
-    #[derive(Default)]
-    struct Expected {
-        pos: Option<Pos>,
-        vel: Option<Vel>,
-        name: Option<Name>,
-    }
-
-    fn check(world: &World, alive: &[(Entity, Expected)], dead: &[Entity]) {
-        assert_eq!(world.len(), alive.len());
-        for (entity, expected) in alive {
-            assert_eq!(world.get::<Pos>(*entity), expected.pos.as_ref());
-            assert_eq!(world.get::<Vel>(*entity), expected.vel.as_ref());
-            assert_eq!(world.get::<Name>(*entity), expected.name.as_ref());
-        }
-        assert!(dead.iter().all(|&entity| !world.contains(entity)));
-    }
-
     // A tiny xorshift generator keeps the test reproducible without a
     // dependency.
     let mut state = 0x2545_f491_4f6c_dd1d_u64;
@@ -264,6 +285,16 @@ fn matches_a_model_under_random_operations() {
             (6, Some(_)) if value % 1000 == 999 => {
                 world.clear();
                 dead.extend(alive.drain(..).map(|(entity, _)| entity));
+            }
+            (6, Some(_)) => {
+                for (pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
+                    pos.0 = pos.0.wrapping_add(vel.0);
+                }
+                for (_, expected) in &mut alive {
+                    if let (Some(pos), Some(vel)) = (&mut expected.pos, &expected.vel) {
+                        pos.0 = pos.0.wrapping_add(vel.0);
+                    }
+                }
             }
             (_, Some(i)) => {
                 let (entity, expected) = &mut alive[i];
