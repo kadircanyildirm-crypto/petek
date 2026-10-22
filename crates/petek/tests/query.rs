@@ -59,13 +59,13 @@ fn queries_visit_every_matching_entity() {
 fn mutable_queries_write_through() {
     let (mut world, [a, b, c, d, _]) = sample();
 
-    for (pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
+    for (mut pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
         pos.0 += vel.0;
     }
     world
         .query_mut::<&mut Vel>()
         .into_iter()
-        .for_each(|vel| vel.0 = -vel.0);
+        .for_each(|mut vel| vel.0 = -vel.0);
 
     assert_eq!(world.get::<Pos>(a), Some(&Pos(1)));
     assert_eq!(world.get::<Pos>(b), Some(&Pos(22)));
@@ -86,9 +86,9 @@ fn optional_components_match_every_entity() {
     assert_eq!(items.len(), 5);
     assert_eq!(&items[..2], [(a, None), (b, Some(20))]);
 
-    for (pos, vel) in world.query_mut::<(&mut Pos, Option<&mut Vel>)>() {
+    for (mut pos, vel) in world.query_mut::<(&mut Pos, Option<&mut Vel>)>() {
         match vel {
-            Some(vel) => vel.0 += pos.0,
+            Some(mut vel) => vel.0 += pos.0,
             None => pos.0 = 0,
         }
     }
@@ -114,7 +114,7 @@ fn filters_narrow_down_the_matches() {
 
     // A filter does not borrow its component, so it can be combined with a
     // mutable borrow of the same component.
-    for pos in world
+    for mut pos in world
         .query_mut::<&mut Pos>()
         .with::<Pos>()
         .without::<Name>()
@@ -141,7 +141,7 @@ fn query_data_nests() {
 fn get_fetches_one_entity() {
     let (mut world, [a, b, ..]) = sample();
 
-    let (pos, vel) = world.query_mut::<(&mut Pos, &mut Vel)>().get(b).unwrap();
+    let (mut pos, mut vel) = world.query_mut::<(&mut Pos, &mut Vel)>().get(b).unwrap();
     std::mem::swap(&mut pos.0, &mut vel.0);
     assert_eq!(world.get::<Pos>(b), Some(&Pos(20)));
 
@@ -211,7 +211,7 @@ fn conflicting_access_is_rejected() {
     );
 
     // The world is unaffected, and disjoint access is fine.
-    for (pos, vel) in world.query_mut::<(&mut Pos, &mut Vel)>() {
+    for (mut pos, vel) in world.query_mut::<(&mut Pos, &mut Vel)>() {
         pos.0 += vel.0;
     }
 }
@@ -312,8 +312,8 @@ fn unusual_component_types() {
 
     let mut world = World::new();
     world.spawn_batch((0..20).map(|i| (Aligned(i), Zst)));
-    for (aligned, zst) in world.query_mut::<(&mut Aligned, &mut Zst)>() {
-        assert_eq!(ptr::from_mut(aligned).addr() % 128, 0);
+    for (mut aligned, mut zst) in world.query_mut::<(&mut Aligned, &mut Zst)>() {
+        assert_eq!(ptr::from_ref(&*aligned).addr() % 128, 0);
         aligned.0 += 1;
         *zst = Zst;
     }
@@ -330,7 +330,7 @@ fn query_states_pick_up_new_archetypes() {
     let mut world = World::new();
     let mut state = QueryState::<(&mut Pos, &Vel), Without<Frozen>>::new(&mut world);
     let mut step = |world: &mut World| {
-        for (pos, vel) in state.iter_mut(world) {
+        for (mut pos, vel) in state.iter_mut(world) {
             pos.0 += vel.0;
         }
     };
@@ -355,8 +355,8 @@ fn query_states_fetch_single_entities() {
     state.get_mut(&mut world, b).unwrap().0 = 7;
     assert_eq!(world.get::<Pos>(b), Some(&Pos(7)));
     assert_eq!(
-        state.get_mut(&mut world, a),
-        Err(QueryError::DoesNotMatch(a))
+        state.get_mut(&mut world, a).err(),
+        Some(QueryError::DoesNotMatch(a))
     );
 
     let reader = QueryState::<(Entity, &Pos)>::new(&mut world);
@@ -385,7 +385,7 @@ fn queries_can_move_to_other_threads() {
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            for (pos, _, vel) in iter {
+            for (mut pos, _, vel) in iter {
                 pos.0 += vel.map_or(0, |vel| vel.0);
             }
         });
@@ -398,10 +398,10 @@ fn borrowed_queries_can_be_used_again() {
     let (mut world, [a, b, ..]) = sample();
 
     let mut query = world.query_mut::<&mut Pos>();
-    for pos in &mut query {
+    for mut pos in &mut query {
         pos.0 += 1;
     }
-    query.iter_mut().for_each(|pos| pos.0 *= 2);
+    query.iter_mut().for_each(|mut pos| pos.0 *= 2);
     query.get_mut(a).unwrap().0 += 100;
     assert_eq!(query.iter_mut().len(), 3);
 

@@ -27,7 +27,7 @@
 //! let frozen = world.spawn((Position(0.0), Velocity(1.0), Frozen));
 //!
 //! let query = world.query_mut::<(&mut Position, &Velocity)>().without::<Frozen>();
-//! for (position, velocity) in query {
+//! for (mut position, velocity) in query {
 //!     position.0 += velocity.0;
 //! }
 //!
@@ -60,6 +60,7 @@ use std::any::type_name;
 use std::error::Error;
 use std::fmt;
 
+use crate::change::Ticks;
 use crate::component::{Component, Components};
 use crate::entity::Entity;
 use crate::world::{NoSuchEntity, World};
@@ -70,7 +71,7 @@ mod iter;
 mod state;
 
 pub use data::{QueryData, ReadOnlyQueryData};
-pub use filter::{Or, QueryFilter, With, Without};
+pub use filter::{Added, ArchetypeFilter, Changed, Or, QueryFilter, With, Without};
 pub use iter::QueryIter;
 pub use state::QueryState;
 
@@ -86,6 +87,8 @@ mod sealed {
     pub trait ReadOnly {}
     /// Implemented by every [`QueryFilter`](super::QueryFilter).
     pub trait Filter {}
+    /// Implemented by every [`ArchetypeFilter`](super::ArchetypeFilter).
+    pub trait Archetypal {}
 }
 
 /// A query over a world, returned by [`World::query`] and
@@ -107,6 +110,7 @@ pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     /// can match.
     data: Option<D::State>,
     filter: F::State,
+    ticks: Ticks,
 }
 
 impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
@@ -118,11 +122,18 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// - For `'w`, the caller must hold the access that `D` reports, and `D`
     ///   must not access any component mutably more than once (see
     ///   [`check_access`]).
-    pub(crate) unsafe fn new(world: &'w World, data: Option<D::State>, filter: F::State) -> Self {
+    /// - `ticks.this_run` must not be older than any tick in the world.
+    pub(crate) unsafe fn new(
+        world: &'w World,
+        data: Option<D::State>,
+        filter: F::State,
+        ticks: Ticks,
+    ) -> Self {
         Self {
             world,
             data,
             filter,
+            ticks,
         }
     }
 
@@ -141,11 +152,13 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// Only matches entities that also pass the filter `G`.
     #[must_use]
     pub fn filter<G: QueryFilter>(self) -> Query<'w, D, (F, G)> {
-        // Filters access no components, so this keeps `new`'s guarantees.
+        // Filters only read ticks, which a query never writes before it has
+        // checked them, so this keeps `new`'s guarantees.
         Query {
             world: self.world,
             data: self.data,
             filter: (self.filter, G::get_state(self.world.components())),
+            ticks: self.ticks,
         }
     }
 
@@ -162,7 +175,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// let mut world = World::new();
     /// let player = world.spawn((Health(10), Shield(5)));
     ///
-    /// let (health, shield) = world.query_mut::<(&mut Health, &mut Shield)>().get(player)?;
+    /// let (mut health, mut shield) = world.query_mut::<(&mut Health, &mut Shield)>().get(player)?;
     /// let absorbed = shield.0.min(8);
     /// shield.0 -= absorbed;
     /// health.0 -= 8 - absorbed;
@@ -181,17 +194,24 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             .get(entity)
             .ok_or(QueryError::NoSuchEntity(entity))?;
         let archetype = self.world.archetypes().get(location.archetype);
-        match &self.data {
-            Some(data) if D::matches(data, archetype) && F::matches(&self.filter, archetype) => {
-                // SAFETY: the archetype matches, the state comes from its
-                // world, and an alive entity's row is in bounds. `new`'s
-                // caller holds the access, and since this consumes the query,
-                // the row is fetched only once (unless the query is read-only
-                // and was copied).
-                Ok(unsafe { D::item(&D::fetch(data, archetype), location.row as usize) })
-            }
-            _ => Err(QueryError::DoesNotMatch(entity)),
+        let row = location.row as usize;
+        let Some(data) = &self.data else {
+            return Err(QueryError::DoesNotMatch(entity));
+        };
+        if !(D::matches(data, archetype) && F::matches(&self.filter, archetype)) {
+            return Err(QueryError::DoesNotMatch(entity));
         }
+        // SAFETY: the archetype matches, the states come from its world, an
+        // alive entity's row is in bounds, and nothing writes the ticks the
+        // filter reads.
+        let passes = unsafe { F::filter_row(&F::fetch(&self.filter, archetype, self.ticks), row) };
+        if !passes {
+            return Err(QueryError::DoesNotMatch(entity));
+        }
+        // SAFETY: as above. `new`'s caller holds the access, and since this
+        // consumes the query, the row is fetched only once (unless the query
+        // is read-only and was copied).
+        Ok(unsafe { D::item(&D::fetch(data, archetype, self.ticks), row) })
     }
 
     /// Iterates over the items of every matching entity, borrowing the query
@@ -248,6 +268,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             world: self.world,
             data: self.data,
             filter: self.filter,
+            ticks: self.ticks,
         }
     }
 }
@@ -268,7 +289,13 @@ impl<'w, D: QueryData, F: QueryFilter> IntoIterator for Query<'w, D, F> {
         let state = self.data.map(|data| (data, self.filter));
         // SAFETY: the state comes from the world whose archetypes are scanned,
         // and `new`'s caller holds the access.
-        unsafe { QueryIter::new(state, Matched::Scan(self.world.archetypes().iter())) }
+        unsafe {
+            QueryIter::new(
+                state,
+                Matched::Scan(self.world.archetypes().iter()),
+                self.ticks,
+            )
+        }
     }
 }
 

@@ -8,6 +8,7 @@ use super::{
     Query, QueryData, QueryError, QueryFilter, QueryIter, ReadOnlyQueryData, check_access,
 };
 use crate::archetype::ArchetypeId;
+use crate::change::{Tick, Ticks};
 use crate::entity::Entity;
 use crate::world::{World, WorldId};
 
@@ -38,7 +39,7 @@ use crate::world::{World, WorldId};
 /// let ball = world.spawn((Position(0.0), Velocity(1.0)));
 /// world.spawn((Position(0.0), Velocity(1.0), Frozen));
 /// for _frame in 0..3 {
-///     for (position, velocity) in movement.iter_mut(&mut world) {
+///     for (mut position, velocity) in movement.iter_mut(&mut world) {
 ///         position.0 += velocity.0;
 ///     }
 /// }
@@ -55,6 +56,9 @@ pub struct QueryState<D: QueryData, F: QueryFilter = ()> {
     /// world.
     matched: Vec<ArchetypeId>,
     checked: usize,
+    /// The world's tick when the query last ran; what is newer counts as
+    /// added or changed.
+    last_run: Tick,
 }
 
 impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
@@ -77,10 +81,14 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             filter,
             matched: Vec::new(),
             checked: 0,
+            last_run: Tick::ZERO,
         }
     }
 
     /// Iterates over the items of every matching entity.
+    ///
+    /// [`Added`](super::Added) and [`Changed`](super::Changed) see what is
+    /// newer than the previous run of `iter` or `iter_mut`.
     ///
     /// # Panics
     ///
@@ -91,10 +99,11 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         D: ReadOnlyQueryData,
     {
         self.update(world);
+        let ticks = self.run(world.change_tick());
         // SAFETY: `update` checked that the state comes from `world` and
         // brought `matched` up to date. `D` only reads, and `&World` rules out
         // writes for `'w`.
-        unsafe { self.iter_unchecked(world) }
+        unsafe { self.iter_unchecked(world, ticks) }
     }
 
     /// Iterates over the items of every matching entity, which may borrow
@@ -106,10 +115,11 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     #[track_caller]
     pub fn iter_mut<'w, 's>(&'s mut self, world: &'w mut World) -> QueryIter<'w, 's, D, F> {
         self.update(world);
+        let ticks = self.run(world.increment_change_tick());
         // SAFETY: as in `iter`, except that `D` may write: `new` checked that
         // it accesses no component mutably more than once, and `&mut World`
         // gives it exclusive access for `'w`.
-        unsafe { self.iter_unchecked(world) }
+        unsafe { self.iter_unchecked(world, ticks) }
     }
 
     /// Returns the item of `entity`.
@@ -128,9 +138,10 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         D: ReadOnlyQueryData,
     {
         self.check_world(world);
+        let ticks = self.peek(world.change_tick());
         // SAFETY: the states come from `world`, `D` only reads, and `&World`
         // rules out writes for `'w`.
-        unsafe { Query::<D, F>::new(world, Some(self.data), self.filter) }.get(entity)
+        unsafe { Query::<D, F>::new(world, Some(self.data), self.filter, ticks) }.get(entity)
     }
 
     /// Returns the item of `entity`, which may borrow components mutably.
@@ -150,10 +161,11 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         entity: Entity,
     ) -> Result<D::Item<'w>, QueryError> {
         self.check_world(world);
+        let ticks = self.peek(world.increment_change_tick());
         // SAFETY: the states come from `world`, `new` checked that `D`
         // accesses no component mutably more than once, and `&mut World`
         // gives it exclusive access for `'w`.
-        unsafe { Query::<D, F>::new(world, Some(self.data), self.filter) }.get(entity)
+        unsafe { Query::<D, F>::new(world, Some(self.data), self.filter, ticks) }.get(entity)
     }
 
     /// Iterates over the matching entities, without checking anything.
@@ -163,11 +175,32 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     /// `update` must have been called with `world` since it last changed
     /// structurally, and for `'w`, the caller must hold the access that `D`
     /// reports.
-    unsafe fn iter_unchecked<'w, 's>(&'s self, world: &'w World) -> QueryIter<'w, 's, D, F> {
+    unsafe fn iter_unchecked<'w, 's>(
+        &'s self,
+        world: &'w World,
+        ticks: Ticks,
+    ) -> QueryIter<'w, 's, D, F> {
         let archetypes = Matched::Cached(world.archetypes(), self.matched.iter());
         // SAFETY: the states come from `world`, `matched` lists each matching
         // archetype once, and the caller holds the access.
-        unsafe { QueryIter::new(Some((self.data, self.filter)), archetypes) }
+        unsafe { QueryIter::new(Some((self.data, self.filter)), archetypes, ticks) }
+    }
+
+    /// Starts a run at `this_run`: the run sees what is newer than the last
+    /// one, and the next run will see what is newer than this one.
+    fn run(&mut self, this_run: Tick) -> Ticks {
+        let ticks = self.peek(this_run);
+        self.last_run = this_run;
+        ticks
+    }
+
+    /// The ticks of a run at `this_run` that does not count as a run, such as
+    /// fetching a single entity.
+    fn peek(&self, this_run: Tick) -> Ticks {
+        Ticks {
+            last_run: self.last_run,
+            this_run,
+        }
     }
 
     /// Checks the archetypes created since the last update.

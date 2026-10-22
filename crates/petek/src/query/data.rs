@@ -5,18 +5,19 @@ use std::ptr::NonNull;
 
 use super::sealed;
 use crate::archetype::Archetype;
+use crate::change::{Mut, Tick, TickSlice, Ticks};
 use crate::component::{Component, ComponentId, ComponentInfo, Components};
 use crate::entity::Entity;
 
 /// Describes what a query fetches for each entity it matches.
 ///
-/// | Query data      | Item                                      | Matches entities  |
-/// | --------------- | ----------------------------------------- | ----------------- |
-/// | `&T`            | `&T`                                      | with a `T`        |
-/// | `&mut T`        | `&mut T`                                  | with a `T`        |
-/// | `Entity`        | the entity                                | all               |
-/// | `Option<D>`     | `Some` of `D`'s item if `D` matches       | all               |
-/// | `(D1, D2, ..)`  | a tuple of the items                      | matching every `Di` |
+/// | Query data     | Item                                | Matches entities    |
+/// | -------------- | ----------------------------------- | ------------------- |
+/// | `&T`           | `&T`                                | with a `T`          |
+/// | `&mut T`       | [`Mut<T>`](crate::Mut)              | with a `T`          |
+/// | `Entity`       | the entity                          | all                 |
+/// | `Option<D>`    | `Some` of `D`'s item if `D` matches | all                 |
+/// | `(D1, D2, ..)` | a tuple of the items                | matching every `Di` |
 ///
 /// Tuples of up to 12 elements are supported, and they nest. `()` matches
 /// every entity and fetches nothing.
@@ -59,13 +60,18 @@ pub trait QueryData: sealed::Data {
     #[doc(hidden)]
     fn matches(state: &Self::State, archetype: &Archetype) -> bool;
 
-    /// Prepares to fetch items from an archetype.
+    /// Prepares to fetch items from an archetype. What the query writes is
+    /// stamped with `ticks.this_run`.
     ///
     /// # Safety
     ///
     /// `archetype` must match, and `state` must come from its world.
     #[doc(hidden)]
-    unsafe fn fetch<'w>(state: &Self::State, archetype: &'w Archetype) -> Self::Fetch<'w>;
+    unsafe fn fetch<'w>(
+        state: &Self::State,
+        archetype: &'w Archetype,
+        ticks: Ticks,
+    ) -> Self::Fetch<'w>;
 
     /// Fetches the item of the entity at `row`.
     ///
@@ -75,9 +81,9 @@ pub trait QueryData: sealed::Data {
     ///   for, and that archetype must not change for `'w`.
     /// - For `'w`, the caller must hold the access that
     ///   [`visit_access`](Self::visit_access) reports: nothing else may write
-    ///   a component the query reads, or access one it writes. This includes
-    ///   other items of the same query, so a query that writes a component
-    ///   must fetch each row at most once.
+    ///   a component (or its ticks) that the query reads, or access one it
+    ///   writes. This includes other items of the same query, so a query that
+    ///   writes a component must fetch each row at most once.
     #[doc(hidden)]
     unsafe fn item<'w>(fetch: &Self::Fetch<'w>, row: usize) -> Self::Item<'w>;
 }
@@ -183,7 +189,7 @@ impl<T: Component> QueryData for &T {
         archetype.contains(id)
     }
 
-    unsafe fn fetch<'w>(&id: &ComponentId, archetype: &'w Archetype) -> Self::Fetch<'w> {
+    unsafe fn fetch<'w>(&id: &ComponentId, archetype: &'w Archetype, _: Ticks) -> Self::Fetch<'w> {
         // The caller guarantees `id` is `T`'s id in this world, so the column
         // stores `T`s.
         ColumnStart::of(id, archetype)
@@ -200,9 +206,10 @@ impl<T: Component> QueryData for &T {
 impl<T: Component> sealed::Data for &mut T {}
 
 impl<T: Component> QueryData for &mut T {
-    type Item<'w> = &'w mut T;
+    type Item<'w> = Mut<'w, T>;
     type State = ComponentId;
-    type Fetch<'w> = ColumnStart<T>;
+    /// The column, its change ticks, and the tick to stamp writes with.
+    type Fetch<'w> = (ColumnStart<T>, TickSlice<'w>, Tick);
 
     fn init_state(components: &mut Components) -> ComponentId {
         components.register(ComponentInfo::of::<T>())
@@ -220,16 +227,30 @@ impl<T: Component> QueryData for &mut T {
         archetype.contains(id)
     }
 
-    unsafe fn fetch<'w>(&id: &ComponentId, archetype: &'w Archetype) -> Self::Fetch<'w> {
+    unsafe fn fetch<'w>(
+        &id: &ComponentId,
+        archetype: &'w Archetype,
+        ticks: Ticks,
+    ) -> Self::Fetch<'w> {
         // As for `&T`.
-        ColumnStart::of(id, archetype)
+        let start = ColumnStart::of(id, archetype);
+        let column = archetype
+            .column_index(id)
+            .expect("the archetype has the component");
+        (
+            start,
+            archetype.column(column).changed_ticks(),
+            ticks.this_run,
+        )
     }
 
     #[inline]
-    unsafe fn item<'w>(start: &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
+    unsafe fn item<'w>((start, changed, this_run): &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
         // SAFETY: the caller guarantees `row` is in bounds of the column, so
-        // it holds a valid `T`, and that nothing else accesses it for `'w`.
-        unsafe { start.row(row).as_mut() }
+        // it holds a valid `T` and a tick, and that nothing else accesses
+        // either for `'w`.
+        let (value, changed) = unsafe { (start.row(row).as_mut(), changed.get_mut(row)) };
+        Mut::new(value, changed, *this_run)
     }
 }
 
@@ -254,7 +275,7 @@ impl QueryData for Entity {
         true
     }
 
-    unsafe fn fetch<'w>((): &(), archetype: &'w Archetype) -> Self::Fetch<'w> {
+    unsafe fn fetch<'w>((): &(), archetype: &'w Archetype, _: Ticks) -> Self::Fetch<'w> {
         archetype.entities()
     }
 
@@ -295,13 +316,17 @@ impl<D: QueryData> QueryData for Option<D> {
         true
     }
 
-    unsafe fn fetch<'w>(state: &Self::State, archetype: &'w Archetype) -> Self::Fetch<'w> {
+    unsafe fn fetch<'w>(
+        state: &Self::State,
+        archetype: &'w Archetype,
+        ticks: Ticks,
+    ) -> Self::Fetch<'w> {
         let state = state
             .as_ref()
             .filter(|state| D::matches(state, archetype))?;
         // SAFETY: `D` matches the archetype, and the caller guarantees the
         // state comes from its world.
-        Some(unsafe { D::fetch(state, archetype) })
+        Some(unsafe { D::fetch(state, archetype, ticks) })
     }
 
     #[inline]
@@ -332,7 +357,7 @@ impl QueryData for () {
         true
     }
 
-    unsafe fn fetch<'w>((): &(), _: &'w Archetype) -> Self::Fetch<'w> {}
+    unsafe fn fetch<'w>((): &(), _: &'w Archetype, _: Ticks) -> Self::Fetch<'w> {}
 
     #[inline]
     unsafe fn item<'w>((): &Self::Fetch<'w>, _: usize) -> Self::Item<'w> {}
@@ -376,11 +401,20 @@ macro_rules! impl_query_data_for_tuples {
                 $first::matches($first, archetype) $(&& $rest::matches($rest, archetype))*
             }
 
-            unsafe fn fetch<'w>(state: &Self::State, archetype: &'w Archetype) -> Self::Fetch<'w> {
+            unsafe fn fetch<'w>(
+                state: &Self::State,
+                archetype: &'w Archetype,
+                ticks: Ticks,
+            ) -> Self::Fetch<'w> {
                 let ($first, $($rest,)*) = state;
                 // SAFETY: a tuple matches only if every element does, and the
                 // caller's guarantee about the state covers every element.
-                unsafe { ($first::fetch($first, archetype), $($rest::fetch($rest, archetype),)*) }
+                unsafe {
+                    (
+                        $first::fetch($first, archetype, ticks),
+                        $($rest::fetch($rest, archetype, ticks),)*
+                    )
+                }
             }
 
             #[inline]

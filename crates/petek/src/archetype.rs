@@ -6,10 +6,11 @@ use std::ptr::NonNull;
 use std::slice;
 
 use crate::bundle::{Bundle, BundleId};
+use crate::change::Tick;
 use crate::component::{ComponentId, Components};
 use crate::entity::Entity;
 use crate::hash::FastHashMap;
-use crate::storage::blob_vec::BlobVec;
+use crate::storage::column::Column;
 use crate::storage::drop_each;
 
 /// Identifies an archetype within one world.
@@ -37,7 +38,7 @@ pub struct Archetype {
     /// The components of this archetype, sorted.
     component_ids: Box<[ComponentId]>,
     /// One column per component, in the same order as `component_ids`.
-    columns: Box<[BlobVec]>,
+    columns: Box<[Column]>,
     /// The entity in each row.
     entities: Vec<Entity>,
     /// Transitions taken when a bundle is inserted into one of the entities.
@@ -48,8 +49,10 @@ pub struct Archetype {
 }
 
 // SAFETY: columns are only ever built from `ComponentInfo`s, which only
-// describe components, and components are `Send + Sync`. Everything else in
-// an archetype is plain data.
+// describe components, and components are `Send + Sync`. The change ticks are
+// in `UnsafeCell`s, which queries only write while they have exclusive access
+// to the component (see `TickSlice`). Everything else in an archetype is plain
+// data.
 unsafe impl Send for Archetype {}
 // SAFETY: as above.
 unsafe impl Sync for Archetype {}
@@ -58,10 +61,7 @@ impl Archetype {
     fn new(component_ids: Box<[ComponentId]>, components: &Components) -> Self {
         let columns = component_ids
             .iter()
-            .map(|&id| {
-                let info = components.info(id);
-                BlobVec::new(info.layout(), info.drop_fn())
-            })
+            .map(|&id| Column::new(components.info(id)))
             .collect();
         Self {
             component_ids,
@@ -97,12 +97,12 @@ impl Archetype {
     }
 
     #[inline]
-    pub(crate) fn column(&self, index: usize) -> &BlobVec {
+    pub(crate) fn column(&self, index: usize) -> &Column {
         &self.columns[index]
     }
 
     #[inline]
-    pub(crate) fn column_mut(&mut self, index: usize) -> &mut BlobVec {
+    pub(crate) fn column_mut(&mut self, index: usize) -> &mut Column {
         &mut self.columns[index]
     }
 
@@ -114,6 +114,9 @@ impl Archetype {
                 .all(|column| column.len() == self.entities.len()),
             "archetype columns are out of sync with its entities",
         );
+        for column in &self.columns {
+            column.debug_assert_consistent();
+        }
     }
 
     /// Makes room for at least `additional` more rows.
@@ -125,7 +128,7 @@ impl Archetype {
     }
 
     /// Moves the components of `bundle` into the spare slots of their
-    /// columns, without counting them yet (see [`BlobVec::write_spare`]).
+    /// columns, without counting them yet (see [`Column::write_spare`]).
     ///
     /// Nothing about the archetype changes until
     /// [`commit_staged`](Self::commit_staged) is called, so if the bundle
@@ -163,10 +166,14 @@ impl Archetype {
     ///
     /// [`stage_bundle`](Self::stage_bundle) must have staged a value in each
     /// of these columns since they last changed.
-    pub(crate) unsafe fn commit_staged(&mut self, columns: &[usize]) {
+    ///
+    /// The values count as added and changed at `tick`. This cannot panic
+    /// once the archetype has [reserved](Self::reserve) room for them.
+    pub(crate) unsafe fn commit_staged(&mut self, columns: &[usize], tick: Tick) {
         for &column in columns {
-            // SAFETY: the caller guarantees a value was staged here.
-            unsafe { self.columns[column].commit_spare() };
+            // SAFETY: the caller guarantees a value was staged here and that
+            // there is room.
+            unsafe { self.columns[column].commit_spare(tick) };
         }
     }
 
@@ -180,7 +187,7 @@ impl Archetype {
     }
 
     /// Overwrites components of `row` with those of `bundle`, dropping the
-    /// old values.
+    /// old values and marking the new ones as changed at `tick`.
     ///
     /// Each column stays consistent even if a destructor or the bundle
     /// panics.
@@ -195,6 +202,7 @@ impl Archetype {
         row: usize,
         bundle: B,
         columns: &[usize],
+        tick: Tick,
     ) {
         debug_assert!(row < self.len());
         let mut columns = columns.iter();
@@ -204,7 +212,7 @@ impl Archetype {
                 .expect("bundle has more components than it reported");
             // SAFETY: `row` is in bounds, the column stores this component,
             // and `take_components` hands over a valid value.
-            unsafe { self.columns[column].replace_unchecked(row, value) };
+            unsafe { self.columns[column].replace_unchecked(row, value, tick) };
         });
     }
 
@@ -305,7 +313,7 @@ impl Archetype {
     pub(crate) unsafe fn take_bundle<B: Bundle>(&mut self, row: usize, columns: &[usize]) -> B {
         /// Removes `row` from the columns that are left when dropped.
         struct Take<'a> {
-            columns: &'a mut [BlobVec],
+            columns: &'a mut [Column],
             left: slice::Iter<'a, usize>,
             row: usize,
         }

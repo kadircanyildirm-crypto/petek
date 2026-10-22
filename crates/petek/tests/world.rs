@@ -302,7 +302,7 @@ fn matches_a_model_under_random_operations() {
                 dead.extend(alive.drain(..).map(|(entity, _)| entity));
             }
             (6, Some(_)) => {
-                for (pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
+                for (mut pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
                     pos.0 = pos.0.wrapping_add(vel.0);
                 }
                 for (_, expected) in &mut alive {

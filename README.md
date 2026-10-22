@@ -24,7 +24,7 @@ let ball = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 2.0 }
 let wall = world.spawn(Position { x: 5.0, y: 0.0 });
 
 // Move everything that has a velocity.
-for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+for (mut position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
     position.x += velocity.x;
     position.y += velocity.y;
 }

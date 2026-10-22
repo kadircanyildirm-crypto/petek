@@ -26,7 +26,7 @@
 //!
 //! // Components can be added and removed at any time.
 //! let velocity = world.remove::<Velocity>(ball)?;
-//! let position = world.get_mut::<Position>(ball).unwrap();
+//! let mut position = world.get_mut::<Position>(ball).unwrap();
 //! position.x += velocity.x;
 //! position.y += velocity.y;
 //!
@@ -44,7 +44,7 @@
 //! # struct Velocity { x: f32, y: f32 }
 //! # impl Component for Velocity {}
 //! # let mut world = World::new();
-//! for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+//! for (mut position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
 //!     position.x += velocity.x;
 //!     position.y += velocity.y;
 //! }
@@ -56,6 +56,7 @@
 
 mod archetype;
 mod bundle;
+mod change;
 pub mod command;
 mod component;
 mod entity;
@@ -66,6 +67,7 @@ mod storage;
 mod world;
 
 pub use bundle::Bundle;
+pub use change::{Mut, Tick};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use resource::Resource;

@@ -1,6 +1,7 @@
 //! Type-erased storage for component data.
 
 pub(crate) mod blob_vec;
+pub(crate) mod column;
 
 use std::ops::Range;
 

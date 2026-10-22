@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archetype::{ArchetypeId, Archetypes, TransitionId};
 use crate::bundle::{Bundle, Bundles};
+use crate::change::{Mut, Tick, Ticks};
 use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
 use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
@@ -36,6 +37,8 @@ pub struct World {
     bundles: Bundles,
     archetypes: Archetypes,
     resources: Resources,
+    /// Moves forward every time something is written; see [`Tick`].
+    change_tick: Tick,
 }
 
 /// Uniquely identifies a world, so that state computed for one world, such as
@@ -74,6 +77,7 @@ impl World {
             bundles: Bundles::default(),
             archetypes: Archetypes::new(),
             resources: Resources::default(),
+            change_tick: Tick::ZERO,
         }
     }
 
@@ -118,8 +122,9 @@ impl World {
     #[track_caller]
     pub fn spawn<B: Bundle>(&mut self, bundle: B) -> Entity {
         let transition = self.spawn_transition::<B>();
+        let tick = self.increment_change_tick();
         // SAFETY: the transition was computed for `B`.
-        unsafe { self.spawn_with(transition, bundle) }
+        unsafe { self.spawn_with(transition, bundle, tick) }
     }
 
     /// Spawns an entity for each bundle in `bundles`.
@@ -149,12 +154,14 @@ impl World {
     {
         let bundles = bundles.into_iter();
         let transition = self.spawn_transition::<I::Item>();
+        let tick = self.increment_change_tick();
         let (_, empty, target) = self.archetypes.split(transition);
         target.unwrap_or(empty).reserve(bundles.size_hint().0);
         SpawnBatch {
             world: self,
             bundles,
             transition,
+            tick,
         }
     }
 
@@ -217,6 +224,7 @@ impl World {
             &self.bundles.info(bundle_id).component_ids,
             &self.components,
         );
+        let tick = self.increment_change_tick();
         let (transition, src, dst) = self.archetypes.split(transition);
         let src_row = location.row as usize;
 
@@ -224,7 +232,7 @@ impl World {
             // The entity already has all of the bundle's components.
             // SAFETY: an alive entity's row is in bounds, and the transition
             // lists the archetype's columns for `B`'s components.
-            unsafe { src.replace_bundle(src_row, bundle, &transition.bundle_columns) };
+            unsafe { src.replace_bundle(src_row, bundle, &transition.bundle_columns, tick) };
             return Ok(());
         };
 
@@ -243,7 +251,7 @@ impl World {
         // `dst`, so committing completes the new row.
         let moved = unsafe {
             let moved = src.move_row_to(src_row, dst, &transition.moved_columns);
-            dst.commit_staged(&transition.bundle_columns);
+            dst.commit_staged(&transition.bundle_columns, tick);
             moved
         };
         self.entities.set_location(
@@ -364,13 +372,19 @@ impl World {
 
     /// Returns a mutable reference to `entity`'s `T` component, if it is alive
     /// and has one.
+    ///
+    /// Writing through it marks the component as changed; see [`Mut`].
     #[must_use]
-    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
+    pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<Mut<'_, T>> {
         let (archetype, column, row) = self.locate::<T>(entity)?;
+        let tick = self.increment_change_tick();
         let column = self.archetypes.get_mut(archetype).column_mut(column);
         // SAFETY: as in `get`, and `&mut self` makes the access exclusive for
         // the returned lifetime.
-        Some(unsafe { column.get_unchecked_mut(row).cast::<T>().as_mut() })
+        let (value, changed) = unsafe { column.get_unchecked_mut(row) };
+        // SAFETY: as above.
+        let value = unsafe { value.cast::<T>().as_mut() };
+        Some(Mut::new(value, changed, tick))
     }
 
     /// Returns a query that reads the components in `D` of every entity that
@@ -393,9 +407,10 @@ impl World {
     #[must_use]
     pub fn query<D: ReadOnlyQueryData>(&self) -> Query<'_, D> {
         let data = D::get_state(&self.components);
+        let ticks = one_off_ticks(self.change_tick);
         // SAFETY: the state comes from this world, `D` only reads, and `&self`
         // rules out writes for the query's lifetime.
-        unsafe { Query::new(self, data, ()) }
+        unsafe { Query::new(self, data, (), ticks) }
     }
 
     /// Returns a query that reads or writes the components in `D` of every
@@ -410,7 +425,7 @@ impl World {
     /// let mut world = World::new();
     /// let ball = world.spawn((Position(0.0), Velocity(2.0)));
     ///
-    /// for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+    /// for (mut position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
     ///     position.0 += velocity.0;
     /// }
     /// assert_eq!(world.get::<Position>(ball).unwrap().0, 2.0);
@@ -426,10 +441,12 @@ impl World {
     pub fn query_mut<D: QueryData>(&mut self) -> Query<'_, D> {
         let data = D::init_state(&mut self.components);
         check_access::<D>(&data, &self.components);
+        let tick = self.increment_change_tick();
+        let ticks = one_off_ticks(tick);
         // SAFETY: the state comes from this world, `D` accesses no component
         // mutably more than once, and `&mut self` gives the query exclusive
         // access to the world for its lifetime.
-        unsafe { Query::new(self, Some(data), ()) }
+        unsafe { Query::new(self, Some(data), (), ticks) }
     }
 
     /// Despawns every entity, dropping all components.
@@ -481,6 +498,22 @@ impl World {
     #[must_use]
     pub fn resource_mut<R: Resource>(&mut self) -> Option<&mut R> {
         self.resources.get_mut()
+    }
+
+    /// The world's current tick, which moves forward every time something is
+    /// written.
+    #[must_use]
+    #[inline]
+    pub fn change_tick(&self) -> Tick {
+        self.change_tick
+    }
+
+    /// Moves the world's tick forward, and returns the new tick, at which the
+    /// write that follows happens.
+    #[inline]
+    pub(crate) fn increment_change_tick(&mut self) -> Tick {
+        self.change_tick = self.change_tick.next();
+        self.change_tick
     }
 
     /// Reserves an entity, which becomes alive, without components, at the
@@ -553,13 +586,18 @@ impl World {
         )
     }
 
-    /// Spawns an entity with the components in `bundle`.
+    /// Spawns an entity with the components in `bundle`, added at `tick`.
     ///
     /// # Safety
     ///
     /// `transition` must be the result of
     /// [`spawn_transition::<B>`](Self::spawn_transition).
-    unsafe fn spawn_with<B: Bundle>(&mut self, transition: TransitionId, bundle: B) -> Entity {
+    unsafe fn spawn_with<B: Bundle>(
+        &mut self,
+        transition: TransitionId,
+        bundle: B,
+        tick: Tick,
+    ) -> Entity {
         self.flush();
         let (transition, empty, target) = self.archetypes.split(transition);
         let archetype = target.unwrap_or(empty);
@@ -577,7 +615,7 @@ impl World {
         // column holds a staged value, and committing them and pushing the
         // entity completes the row.
         unsafe {
-            archetype.commit_staged(&transition.bundle_columns);
+            archetype.commit_staged(&transition.bundle_columns, tick);
             archetype.push_entity(entity);
         }
         archetype.debug_assert_consistent();
@@ -591,6 +629,15 @@ impl World {
         let id = self.components.id(TypeId::of::<T>())?;
         let column = self.archetypes.get(location.archetype).column_index(id)?;
         Some((location.archetype, column, location.row as usize))
+    }
+}
+
+/// The ticks of a one-off query: it has never run before, so everything counts
+/// as added and changed.
+fn one_off_ticks(this_run: Tick) -> Ticks {
+    Ticks {
+        last_run: Tick::ZERO,
+        this_run,
     }
 }
 
@@ -621,6 +668,8 @@ where
     world: &'w mut World,
     bundles: I,
     transition: TransitionId,
+    /// The tick at which the whole batch counts as added.
+    tick: Tick,
 }
 
 impl<I> Iterator for SpawnBatch<'_, I>
@@ -634,7 +683,7 @@ where
     fn next(&mut self) -> Option<Entity> {
         let bundle = self.bundles.next()?;
         // SAFETY: `spawn_batch` computed the transition for `I::Item`.
-        Some(unsafe { self.world.spawn_with(self.transition, bundle) })
+        Some(unsafe { self.world.spawn_with(self.transition, bundle, self.tick) })
     }
 
     #[inline]
