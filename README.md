@@ -21,11 +21,18 @@ impl Component for Velocity {}
 
 let mut world = World::new();
 let ball = world.spawn((Position { x: 0.0, y: 0.0 }, Velocity { x: 1.0, y: 2.0 }));
+let wall = world.spawn(Position { x: 5.0, y: 0.0 });
 
-let velocity = world.remove::<Velocity>(ball).unwrap();
-let position = world.get_mut::<Position>(ball).unwrap();
-position.x += velocity.x;
-position.y += velocity.y;
+// Move everything that has a velocity.
+for (position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
+    position.x += velocity.x;
+    position.y += velocity.y;
+}
+
+// Components can be added and removed at any time.
+world.remove::<Velocity>(ball).unwrap();
+assert!(world.query::<&Velocity>().into_iter().next().is_none());
+assert_eq!(world.get::<Position>(wall).unwrap().x, 5.0);
 ```
 
 ## Soundness
@@ -38,6 +45,8 @@ strict standard:
 - structural changes run no user code until the world is consistent again,
   so a panicking destructor can neither cause a double drop nor leave an
   entity half-moved;
+- the borrow checker keeps queries from overlapping with writes, and a query
+  that would alias a mutable reference, such as `(&mut A, &A)`, is rejected;
 - CI runs the whole test suite under [Miri] with strict provenance, under both
   the Stacked Borrows and Tree Borrows aliasing models, and on 32-bit and
   big-endian targets.
@@ -51,7 +60,7 @@ strict standard:
 - [x] Generational entity ids
 - [x] Type-erased column storage
 - [x] Archetypes and `World`
-- [ ] Queries with filters
+- [x] Queries with filters, and cached query state
 - [ ] Resources, commands and change detection
 - [ ] Systems and a parallel scheduler
 - [ ] Events, examples and benchmarks

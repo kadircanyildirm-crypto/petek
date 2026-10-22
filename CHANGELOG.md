@@ -16,3 +16,10 @@ and this project adheres to
   and for nested tuples of up to 12 bundles.
 - `Entity` handles with generations, convertible to and from `u64`.
 - The `NoSuchEntity` and `RemoveError` error types.
+- Queries: `World::query` for read-only queries and `World::query_mut` for
+  queries that write, over `&T`, `&mut T`, `Entity`, `Option` and nested
+  tuples, with the `With`, `Without` and `Or` filters. `Query::get` and
+  `Query::get_mut` fetch a single entity. Query iterators are exact-size,
+  and `Send` and `Sync`.
+- `QueryState`, which caches the archetypes a query matches between runs.
+- The `QueryError` error type.

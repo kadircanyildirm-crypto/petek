@@ -15,6 +15,11 @@ It is meant to be read before the code.
 | `storage/mod.rs` | `drop_each`, which keeps dropping values after a destructor panics. |
 | `archetype.rs` | `Archetype` tables, and `Archetypes`: all tables plus the cached `Transition`s between them. |
 | `world.rs` | `World`, the public entry point that ties everything together. |
+| `query/data.rs` | `QueryData`: what a query fetches, implemented for `&T`, `&mut T`, `Entity`, `Option` and tuples. |
+| `query/filter.rs` | `QueryFilter`: `With`, `Without`, `Or` and tuples. |
+| `query/iter.rs` | `QueryIter`, which walks the matching archetypes row by row. |
+| `query/state.rs` | `QueryState`, which caches the archetypes a query matches. |
+| `query/mod.rs` | `Query`, the access check, and the seal on the query traits. |
 | `hash.rs` | A fast hasher for the internal lookup tables. |
 
 ## Data model
@@ -84,6 +89,51 @@ panics, the rest are still dropped while unwinding, as standard containers do,
 and a second panic aborts. Overwriting a component in place moves the new
 value in even if the old value's destructor panics.
 
+## Queries
+
+A query is described by two types: its `QueryData`, such as
+`(Entity, &mut Position, &Velocity)`, and its `QueryFilter`, such as
+`Without<Frozen>`. Both work in three steps:
+
+1. **Once per world**, the query resolves its *state*: the `ComponentId`s of
+   its component types.
+2. **Once per archetype**, it decides whether the archetype matches, and if so
+   prepares a *fetch*: a pointer to the start of each column it reads.
+3. **Once per row**, it offsets those pointers by the row to produce the item.
+
+So iterating over a query is, for each matching archetype, a tight loop over
+contiguous columns. `QueryIter` overrides `fold`, so that `for_each` and most
+iterator adapters run exactly that loop, and computes `size_hint` and `count`
+from the archetype sizes alone.
+
+A `QueryState` keeps the state and the list of matching archetypes between
+runs. Archetypes are never removed, so on each run it only checks the
+archetypes created since the last one.
+
+### Why handing out `&mut T` is sound
+
+- **Within a query**, every row of every matching archetype is visited once,
+  so items never overlap, unless the query itself names a component twice.
+  Each query reports which components it reads and writes, and a query that
+  writes a component it also accesses elsewhere, such as `(&mut A, &A)`, is
+  rejected with a panic when it is created.
+- **Across queries**, the borrow checker does the work: `World::query` takes
+  `&World` and only accepts `ReadOnlyQueryData`, while `World::query_mut`
+  takes `&mut World`. Items borrow the world, so no structural change can
+  happen while one is alive.
+- **Pointers**: a query reaches the world through a shared reference, which
+  covers the `BlobVec` headers but not the items, as those live in separate
+  allocations. Writing items through the column pointers is therefore fine
+  under both Stacked and Tree Borrows, as long as access is exclusive, which
+  the points above ensure.
+- **States**: component and archetype ids are only meaningful in one world.
+  Every world gets a unique id, and a `QueryState` used with another world
+  panics.
+- **Sealing**: the query traits cannot be implemented outside the crate, since
+  the points above rely on every implementation reporting its access
+  correctly. `ReadOnlyQueryData` is sealed separately, as `&mut Local`
+  implements `QueryData` and would otherwise be eligible.
+
 ## Invariants
 
 The `unsafe` code relies on these invariants:
@@ -95,6 +145,7 @@ The `unsafe` code relies on these invariants:
 3. Column `i` of an archetype stores values of the type of the archetype's
    `i`-th component id; component ids are sorted and unique.
 4. Each set of components has at most one archetype.
+5. Archetypes are never removed, and their ids never change.
 
 Debug builds assert invariant 2 after every structural change.
 
@@ -108,7 +159,10 @@ Debug builds assert invariant 2 after every structural change.
   `unsafe` functions.
 - The test suite includes panicking destructors, a hand-written bundle that
   panics halfway, zero-sized and over-aligned types, and a randomized
-  model-based test of spawn, despawn, insert, remove and clear.
+  model-based test of spawn, despawn, insert, remove, clear and queries, both
+  cached and not.
+- Examples that must not compile, such as a read-only query that writes,
+  state the error they expect, and CI checks it on nightly.
 - CI runs the suite under [Miri] with strict provenance, under both the
   Stacked Borrows and Tree Borrows aliasing models, and on 32-bit and
   big-endian targets.
@@ -117,5 +171,5 @@ Debug builds assert invariant 2 after every structural change.
 
 ## Not yet implemented
 
-Queries, resources, deferred commands, change detection, systems and a
-parallel scheduler. See the roadmap in the README.
+Resources, deferred commands, change detection, systems and a parallel
+scheduler. See the roadmap in the README.
