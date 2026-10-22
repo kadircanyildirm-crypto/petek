@@ -89,6 +89,15 @@ impl Column {
         TickSlice::new(&self.changed)
     }
 
+    /// The tick at which the value at `row` was added.
+    ///
+    /// # Panics
+    ///
+    /// If `row` is out of bounds.
+    pub(crate) fn added_tick_mut(&mut self, row: usize) -> &mut Tick {
+        self.added[row].get_mut()
+    }
+
     /// Returns a pointer to the value at `row`, for reading.
     ///
     /// # Safety

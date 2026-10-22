@@ -254,6 +254,13 @@ impl World {
             dst.commit_staged(&transition.bundle_columns, tick);
             moved
         };
+        // Overwriting a component changes it but does not add it, so values
+        // the bundle replaces pass their `added` tick on to their successors.
+        // `move_row_to` left them in place, at `src_row`.
+        for &(src_column, dst_column) in &transition.replaced_columns {
+            let added = *src.column_mut(src_column).added_tick_mut(src_row);
+            *dst.column_mut(dst_column).added_tick_mut(dst_row as usize) = added;
+        }
         self.entities.set_location(
             entity,
             EntityLocation {
@@ -267,7 +274,7 @@ impl World {
         // Phase 2: drop the values the bundle replaced.
         // SAFETY: `move_row_to` left `src_row` in exactly the columns that it
         // did not move, which are the replaced ones.
-        unsafe { src.drop_from_columns(src_row, &transition.replaced_columns) };
+        unsafe { src.drop_replaced(src_row, &transition.replaced_columns) };
         src.debug_assert_consistent();
         dst.debug_assert_consistent();
         Ok(())

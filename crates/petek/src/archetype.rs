@@ -283,18 +283,19 @@ impl Archetype {
         });
     }
 
-    /// Removes `row` from the given columns, dropping those components. Like
-    /// [`drop_row`](Self::drop_row), it finishes even if a destructor panics.
+    /// Removes `row` from the columns that a [`Transition`] lists as
+    /// replaced, dropping those components. Like [`drop_row`](Self::drop_row),
+    /// it finishes even if a destructor panics.
     ///
     /// # Safety
     ///
     /// `row` must be in bounds of each of these columns, and the columns must
     /// be distinct.
-    pub(crate) unsafe fn drop_from_columns(&mut self, row: usize, columns: &[usize]) {
+    pub(crate) unsafe fn drop_replaced(&mut self, row: usize, replaced: &[(usize, usize)]) {
         let all = &mut self.columns;
-        drop_each(0..columns.len(), |index| {
+        drop_each(0..replaced.len(), |index| {
             // SAFETY: the caller guarantees `row` is in bounds of this column.
-            unsafe { all[columns[index]].swap_remove_and_drop_unchecked(row) };
+            unsafe { all[replaced[index].0].swap_remove_and_drop_unchecked(row) };
         });
     }
 
@@ -389,9 +390,10 @@ pub(crate) struct Transition {
     /// `(column in src, column in dst)` for each component that is carried
     /// over unchanged. Empty if `src == dst`.
     pub(crate) moved_columns: Box<[(usize, usize)]>,
-    /// When inserting into a different archetype, the columns of `src` whose
-    /// values the bundle replaces. Empty otherwise.
-    pub(crate) replaced_columns: Box<[usize]>,
+    /// When inserting into a different archetype, `(column in src, column in
+    /// dst)` for each component whose value the bundle replaces. Empty
+    /// otherwise.
+    pub(crate) replaced_columns: Box<[(usize, usize)]>,
 }
 
 /// All archetypes of a world, and the transitions between them.
@@ -495,7 +497,7 @@ impl Archetypes {
         if src != dst {
             for (src_column, &id) in src_archetype.component_ids.iter().enumerate() {
                 if bundle_ids.contains(&id) {
-                    replaced_columns.push(src_column);
+                    replaced_columns.push((src_column, column_in_dst(id)));
                 } else {
                     moved_columns.push((src_column, column_in_dst(id)));
                 }
@@ -659,7 +661,7 @@ mod tests {
         let with_abc = insert.dst;
         assert_eq!(archetypes.get(with_abc).component_ids.len(), 3);
         assert_eq!(&*insert.moved_columns, [(0, 0)]);
-        assert_eq!(&*insert.replaced_columns, [1]);
+        assert_eq!(&*insert.replaced_columns, [(1, 1)]);
         assert_eq!(&*insert.bundle_columns, [2, 1]);
 
         // Removing (C, B) from {A, B} is impossible, but from {A, B, C} it

@@ -34,8 +34,10 @@ fn added_sees_new_components_once() {
     let b = world.spawn(Pos(1));
     let c = world.spawn(Vel(2));
     world.insert(c, Pos(2)).unwrap();
-    // Overwriting a component changes it, but does not add it.
+    // Overwriting a component changes it, but does not add it, whether the
+    // entity stays in its archetype or moves to another.
     world.insert(a, Pos(3)).unwrap();
+    world.insert(a, (Pos(4), Vel(4))).unwrap();
     assert_eq!(seen(&mut added, &world), [b, c]);
     assert_eq!(seen(&mut added, &world), []);
 }
