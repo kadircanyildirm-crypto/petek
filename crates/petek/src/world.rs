@@ -49,9 +49,15 @@ impl WorldId {
     /// If the ids have run out, which takes `usize::MAX` worlds.
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map(Self)
-            .expect("too many worlds")
+        // Unlike `fetch_add`, this never wraps around to an id in use.
+        let mut id = NEXT.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).expect("too many worlds");
+            match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Self(id),
+                Err(current) => id = current,
+            }
+        }
     }
 }
 
@@ -62,7 +68,7 @@ impl World {
         Self {
             id: WorldId::new(),
             entities: Entities::default(),
-            components: Components::default(),
+            components: Components::new(),
             bundles: Bundles::default(),
             archetypes: Archetypes::new(),
         }
