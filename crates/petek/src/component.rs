@@ -24,7 +24,7 @@ use crate::storage::blob_vec::{DropFn, drop_fn_of};
 /// Components must be `Send + Sync` so that worlds can be shared between
 /// threads. This does not compile, because `Rc` is neither:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use std::rc::Rc;
 ///
 /// struct Shared(Rc<u32>);

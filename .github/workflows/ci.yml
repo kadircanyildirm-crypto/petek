@@ -45,6 +45,16 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo doc --workspace --no-deps --document-private-items
 
+  # Stable rustdoc ignores the error codes of `compile_fail` examples, while
+  # nightly checks that each example fails for the reason it states.
+  compile-fail:
+    name: Compile-fail examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test --workspace --doc
+
   # The unsafe code is checked under both of Rust's candidate aliasing models,
   # and on 32-bit and big-endian targets.
   miri:
