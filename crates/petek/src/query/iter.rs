@@ -6,7 +6,15 @@ use std::ops::Range;
 use std::slice;
 
 use super::{QueryData, QueryFilter};
-use crate::archetype::Archetype;
+use crate::archetype::{Archetype, ArchetypeId, Archetypes};
+
+/// The archetypes a query iterator has left to visit.
+pub(crate) enum Matched<'w> {
+    /// Archetypes that are each still to be checked against the query.
+    Scan(slice::Iter<'w, Archetype>),
+    /// Archetypes already known to match the query.
+    Cached(&'w Archetypes, slice::Iter<'w, ArchetypeId>),
+}
 
 /// An iterator over the items of a query, one per matching entity.
 ///
@@ -15,9 +23,7 @@ pub struct QueryIter<'w, D: QueryData, F: QueryFilter = ()> {
     /// `None` if the query cannot match anything, because some of its
     /// components are not registered.
     state: Option<(D::State, F::State)>,
-    /// The archetypes left to visit, each still to be checked against the
-    /// query.
-    archetypes: slice::Iter<'w, Archetype>,
+    archetypes: Matched<'w>,
     /// The archetype being visited, and its rows that are left.
     current: Option<(D::Fetch<'w>, Range<usize>)>,
 }
@@ -28,14 +34,12 @@ impl<'w, D: QueryData, F: QueryFilter> QueryIter<'w, D, F> {
     /// # Safety
     ///
     /// - The state, if any, must come from the world that the archetypes
-    ///   belong to.
+    ///   belong to, and `Matched::Cached` must only list archetypes that
+    ///   match it, each at most once.
     /// - For `'w`, the caller must hold the access that `D` reports, and `D`
     ///   must not access any component mutably more than once (see
     ///   [`check_access`](super::check_access)).
-    pub(crate) unsafe fn new(
-        state: Option<(D::State, F::State)>,
-        archetypes: slice::Iter<'w, Archetype>,
-    ) -> Self {
+    pub(crate) unsafe fn new(state: Option<(D::State, F::State)>, archetypes: Matched<'w>) -> Self {
         Self {
             state,
             archetypes,
@@ -47,9 +51,17 @@ impl<'w, D: QueryData, F: QueryFilter> QueryIter<'w, D, F> {
     /// prepares to fetch from it.
     fn next_archetype(&mut self) -> Option<(D::Fetch<'w>, Range<usize>)> {
         let (data, filter) = self.state.as_ref()?;
-        let archetype = self.archetypes.find(|archetype| {
+        let matches = |archetype: &&Archetype| {
             archetype.len() > 0 && D::matches(data, archetype) && F::matches(filter, archetype)
-        })?;
+        };
+        let archetype = match &mut self.archetypes {
+            Matched::Scan(archetypes) => archetypes.find(matches)?,
+            Matched::Cached(archetypes, ids) => {
+                let archetypes: &'w Archetypes = archetypes;
+                ids.map(|&id| archetypes.get(id))
+                    .find(|archetype| archetype.len() > 0)?
+            }
+        };
         // SAFETY: the archetype matches, and `new`'s caller guarantees that
         // the state comes from its world.
         let fetch = unsafe { D::fetch(data, archetype) };
@@ -97,13 +109,17 @@ impl<'w, D: QueryData, F: QueryFilter> Iterator for QueryIter<'w, D, F> {
     /// time proportional to the number of archetypes.
     fn size_hint(&self) -> (usize, Option<usize>) {
         let current = self.current.as_ref().map_or(0, |(_, rows)| rows.len());
-        let rest: usize = self.state.as_ref().map_or(0, |(data, filter)| {
-            self.archetypes
+        let rest: usize = match (&self.state, &self.archetypes) {
+            (None, _) => 0,
+            (Some((data, filter)), Matched::Scan(archetypes)) => archetypes
                 .clone()
                 .filter(|archetype| D::matches(data, archetype) && F::matches(filter, archetype))
                 .map(Archetype::len)
-                .sum()
-        });
+                .sum(),
+            (Some(_), Matched::Cached(archetypes, ids)) => {
+                ids.clone().map(|&id| archetypes.get(id).len()).sum()
+            }
+        };
         let len = current + rest;
         (len, Some(len))
     }

@@ -4,6 +4,7 @@ use std::any::TypeId;
 use std::error::Error;
 use std::fmt;
 use std::iter::FusedIterator;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archetype::{ArchetypeId, Archetypes, TransitionId};
 use crate::bundle::{Bundle, Bundles};
@@ -28,10 +29,30 @@ use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
 ///
 /// An [`Entity`] handle is only meaningful in the world that spawned it.
 pub struct World {
+    id: WorldId,
     entities: Entities,
     components: Components,
     bundles: Bundles,
     archetypes: Archetypes,
+}
+
+/// Uniquely identifies a world, so that state computed for one world, such as
+/// a [`QueryState`](crate::query::QueryState), is never used with another.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct WorldId(usize);
+
+impl WorldId {
+    /// Returns an id that no other world has had.
+    ///
+    /// # Panics
+    ///
+    /// If the ids have run out, which takes `usize::MAX` worlds.
+    fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map(Self)
+            .expect("too many worlds")
+    }
 }
 
 impl World {
@@ -39,6 +60,7 @@ impl World {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            id: WorldId::new(),
             entities: Entities::default(),
             components: Components::default(),
             bundles: Bundles::default(),
@@ -361,7 +383,7 @@ impl World {
         let data = D::get_state(&self.components);
         // SAFETY: the state comes from this world, `D` only reads, and `&self`
         // rules out writes for the query's lifetime.
-        unsafe { Query::new(self, data) }
+        unsafe { Query::new(self, data, ()) }
     }
 
     /// Returns a query that reads or writes the components in `D` of every
@@ -395,7 +417,7 @@ impl World {
         // SAFETY: the state comes from this world, `D` accesses no component
         // mutably more than once, and `&mut self` gives the query exclusive
         // access to the world for its lifetime.
-        unsafe { Query::new(self, Some(data)) }
+        unsafe { Query::new(self, Some(data), ()) }
     }
 
     /// Despawns every entity, dropping all components.
@@ -408,6 +430,11 @@ impl World {
     }
 
     #[inline]
+    pub(crate) fn id(&self) -> WorldId {
+        self.id
+    }
+
+    #[inline]
     pub(crate) fn entities(&self) -> &Entities {
         &self.entities
     }
@@ -415,6 +442,11 @@ impl World {
     #[inline]
     pub(crate) fn components(&self) -> &Components {
         &self.components
+    }
+
+    #[inline]
+    pub(crate) fn components_mut(&mut self) -> &mut Components {
+        &mut self.components
     }
 
     #[inline]

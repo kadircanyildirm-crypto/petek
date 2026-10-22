@@ -415,6 +415,18 @@ impl Archetypes {
         self.by_id.iter()
     }
 
+    /// Iterates over the archetypes from the `start`-th on, with their ids.
+    pub(crate) fn iter_from(
+        &self,
+        start: usize,
+    ) -> impl Iterator<Item = (ArchetypeId, &Archetype)> + '_ {
+        let archetypes = self.by_id.get(start..).unwrap_or_default();
+        (start..).zip(archetypes).map(|(index, archetype)| {
+            let id = u32::try_from(index).expect("archetype ids fit in a u32");
+            (ArchetypeId(id), archetype)
+        })
+    }
+
     #[inline]
     pub(crate) fn get(&self, id: ArchetypeId) -> &Archetype {
         &self.by_id[id.index()]

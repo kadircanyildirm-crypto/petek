@@ -5,6 +5,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use petek::query::{QueryState, Without};
 use petek::{Component, Entity, World};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -194,8 +195,16 @@ struct Expected {
     name: Option<Name>,
 }
 
+/// The query that [`check`] runs both once and through a cached state.
+type Checked = (Entity, &'static Pos, Option<&'static Name>);
+
 /// Checks the world against the model.
-fn check(world: &World, alive: &[(Entity, Expected)], dead: &[Entity]) {
+fn check(
+    world: &World,
+    state: &mut QueryState<Checked, Without<Vel>>,
+    alive: &[(Entity, Expected)],
+    dead: &[Entity],
+) {
     assert_eq!(world.len(), alive.len());
     for (entity, expected) in alive {
         assert_eq!(world.get::<Pos>(*entity), expected.pos.as_ref());
@@ -204,14 +213,19 @@ fn check(world: &World, alive: &[(Entity, Expected)], dead: &[Entity]) {
     }
     assert!(dead.iter().all(|&entity| !world.contains(entity)));
 
-    // A query visits every entity that has the components exactly once.
+    // A query visits every entity that has the components exactly once,
+    // whether it runs once or through a state that caches the archetypes.
+    let items = |(entity, pos, name): (Entity, &Pos, Option<&Name>)| (entity, pos.0, name.cloned());
     let mut queried: Vec<_> = world
-        .query::<(Entity, &Pos, Option<&Name>)>()
+        .query::<Checked>()
         .without::<Vel>()
         .into_iter()
-        .map(|(entity, pos, name)| (entity, pos.0, name.cloned()))
+        .map(items)
         .collect();
     queried.sort_by_key(|&(entity, ..)| entity);
+    let mut cached: Vec<_> = state.iter(world).map(items).collect();
+    cached.sort_by_key(|&(entity, ..)| entity);
+    assert_eq!(cached, queried);
     let mut expected: Vec<_> = alive
         .iter()
         .filter(|(_, expected)| expected.vel.is_none())
@@ -239,6 +253,7 @@ fn matches_a_model_under_random_operations() {
     };
 
     let mut world = World::new();
+    let mut state = QueryState::new(&mut world);
     let mut alive: Vec<(Entity, Expected)> = Vec::new();
     let mut dead = Vec::new();
     let steps = if cfg!(miri) { 400 } else { 10_000 };
@@ -311,8 +326,8 @@ fn matches_a_model_under_random_operations() {
             }
         }
         if value % 100 == 0 {
-            check(&world, &alive, &dead);
+            check(&world, &mut state, &alive, &dead);
         }
     }
-    check(&world, &alive, &dead);
+    check(&world, &mut state, &alive, &dead);
 }

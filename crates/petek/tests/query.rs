@@ -3,7 +3,7 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
-use petek::query::{Or, QueryError, With, Without};
+use petek::query::{Or, QueryError, QueryState, With, Without};
 use petek::{Component, Entity, World};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,4 +323,52 @@ fn unusual_component_types() {
         .map(|aligned| u32::from(aligned.0))
         .sum();
     assert_eq!(sum, (1..=20).sum());
+}
+
+#[test]
+fn query_states_pick_up_new_archetypes() {
+    let mut world = World::new();
+    let mut state = QueryState::<(&mut Pos, &Vel), Without<Frozen>>::new(&mut world);
+    let mut step = |world: &mut World| {
+        for (pos, vel) in state.iter_mut(world) {
+            pos.0 += vel.0;
+        }
+    };
+
+    let a = world.spawn((Pos(0), Vel(1)));
+    step(&mut world);
+    let b = world.spawn((Pos(0), Vel(2), Name("b")));
+    let frozen = world.spawn((Pos(0), Vel(3), Frozen));
+    step(&mut world);
+    world.despawn(a).unwrap(); // leaves an empty archetype behind
+    step(&mut world);
+
+    assert_eq!(world.get::<Pos>(b), Some(&Pos(4)));
+    assert_eq!(world.get::<Pos>(frozen), Some(&Pos(0)));
+}
+
+#[test]
+fn query_states_fetch_single_entities() {
+    let (mut world, [a, b, c, ..]) = sample();
+    let mut state = QueryState::<&mut Pos, With<Vel>>::new(&mut world);
+
+    state.get_mut(&mut world, b).unwrap().0 = 7;
+    assert_eq!(world.get::<Pos>(b), Some(&Pos(7)));
+    assert_eq!(
+        state.get_mut(&mut world, a),
+        Err(QueryError::DoesNotMatch(a))
+    );
+
+    let reader = QueryState::<(Entity, &Pos)>::new(&mut world);
+    assert_eq!(reader.get(&world, c), Ok((c, &Pos(3))));
+    world.despawn(c).unwrap();
+    assert_eq!(reader.get(&world, c), Err(QueryError::NoSuchEntity(c)));
+    assert_eq!(state.iter_mut(&mut world).count(), 1);
+}
+
+#[test]
+#[should_panic(expected = "accesses")]
+fn query_states_reject_conflicting_access() {
+    let mut world = World::new();
+    let _ = QueryState::<(&mut Pos, Option<&Pos>)>::new(&mut world);
 }

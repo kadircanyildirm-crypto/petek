@@ -39,6 +39,10 @@
 //! assert_eq!(moved, [moving]);
 //! ```
 //!
+//! Each run checks every archetype against the query. For a query that runs
+//! over and over, a [`QueryState`] remembers which archetypes match, and only
+//! checks archetypes created since its last run.
+//!
 //! A query borrows the world, so entities cannot be spawned, despawned or
 //! changed structurally while it runs:
 //!
@@ -63,12 +67,15 @@ use crate::world::{NoSuchEntity, World};
 mod data;
 mod filter;
 mod iter;
+mod state;
 
 pub use data::{QueryData, ReadOnlyQueryData};
 pub use filter::{Or, QueryFilter, With, Without};
 pub use iter::QueryIter;
+pub use state::QueryState;
 
 use data::Access;
+use iter::Matched;
 
 /// Keeps the query traits from being implemented outside of this crate, since
 /// the soundness of queries relies on their implementations.
@@ -103,15 +110,15 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     ///
     /// # Safety
     ///
-    /// - `data`, if any, must come from `world`.
+    /// - The states must come from `world`.
     /// - For `'w`, the caller must hold the access that `D` reports, and `D`
     ///   must not access any component mutably more than once (see
     ///   [`check_access`]).
-    pub(crate) unsafe fn new(world: &'w World, data: Option<D::State>) -> Self {
+    pub(crate) unsafe fn new(world: &'w World, data: Option<D::State>, filter: F::State) -> Self {
         Self {
             world,
             data,
-            filter: F::get_state(world.components()),
+            filter,
         }
     }
 
@@ -192,7 +199,7 @@ impl<'w, D: QueryData, F: QueryFilter> IntoIterator for Query<'w, D, F> {
         let state = self.data.map(|data| (data, self.filter));
         // SAFETY: the state comes from the world whose archetypes are scanned,
         // and `new`'s caller holds the access.
-        unsafe { QueryIter::new(state, self.world.archetypes().iter()) }
+        unsafe { QueryIter::new(state, Matched::Scan(self.world.archetypes().iter())) }
     }
 }
 
