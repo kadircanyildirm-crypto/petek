@@ -206,7 +206,7 @@ mod tests {
             type_ids::<((A, B), (), C)>(),
             [TypeId::of::<A>(), TypeId::of::<B>(), TypeId::of::<C>()],
         );
-        assert!(type_ids::<()>().is_empty());
+        assert_eq!(type_ids::<()>(), Vec::<TypeId>::new());
     }
 
     #[test]
