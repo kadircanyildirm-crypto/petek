@@ -204,15 +204,44 @@ impl Entities {
     ///
     /// If there are no entities left to hand out.
     pub(crate) fn reserve(&self) -> Entity {
-        // Each caller gets a different `n`. `free` and `meta` cannot change
-        // while `&self` is held, so no stronger ordering is needed.
-        let n = self.unreserved.fetch_sub(1, Ordering::Relaxed);
-        if n > 0 {
-            let index = self.free[n.unsigned_abs() - 1];
+        // A compare-and-swap loop rather than `fetch_sub`, so that the count
+        // never moves when there is nothing left to hand out, and so can
+        // never wrap around to hand out an entity twice. `free` and `meta`
+        // cannot change while `&self` is held, so no stronger ordering is
+        // needed than what makes each reservation unique.
+        let mut unreserved = self.unreserved.load(Ordering::Relaxed);
+        loop {
+            let entity = self.reservation(unreserved);
+            let next = unreserved.checked_sub(1).expect("too many entities");
+            match self.unreserved.compare_exchange_weak(
+                unreserved,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return entity,
+                Err(current) => unreserved = current,
+            }
+        }
+    }
+
+    /// The entity that a reservation gets while `unreserved` free slots are
+    /// left.
+    ///
+    /// # Panics
+    ///
+    /// If there are no entities left to hand out.
+    fn reservation(&self, unreserved: isize) -> Entity {
+        if unreserved > 0 {
+            let index = self.free[unreserved.unsigned_abs() - 1];
             Entity::new(index, self.meta[index as usize].generation)
         } else {
-            let index = self.meta.len() + n.unsigned_abs();
-            let index = u32::try_from(index).expect("too many entities");
+            let index = self
+                .meta
+                .len()
+                .checked_add(unreserved.unsigned_abs())
+                .and_then(|index| u32::try_from(index).ok())
+                .expect("too many entities");
             Entity::new(index, NonZeroU32::MIN)
         }
     }

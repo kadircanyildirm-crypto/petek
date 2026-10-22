@@ -61,6 +61,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::change::Ticks;
+use crate::command::{CommandQueue, Commands};
 use crate::component::{Component, Components};
 use crate::entity::Entity;
 use crate::world::{NoSuchEntity, World};
@@ -212,6 +213,49 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         // consumes the query, the row is fetched only once (unless the query
         // is read-only and was copied).
         Ok(unsafe { D::item(&D::fetch(data, archetype, self.ticks), row) })
+    }
+
+    /// Returns a [`Commands`] that records into `queue`, and can be used while
+    /// this query runs, even if the query writes.
+    ///
+    /// That is sound because commands only reserve entities until the queue
+    /// is applied, and queries never write the entity allocator. The
+    /// commands do not borrow the query, so it can still be consumed:
+    ///
+    /// ```
+    /// # use petek::command::CommandQueue;
+    /// # use petek::{Component, Entity, World};
+    /// # struct Fuse(u32);
+    /// # impl Component for Fuse {}
+    /// # struct Explosion;
+    /// # impl Component for Explosion {}
+    /// let mut world = World::new();
+    /// world.spawn_batch([Fuse(1), Fuse(3)]);
+    ///
+    /// let mut queue = CommandQueue::new();
+    /// let query = world.query_mut::<(Entity, &mut Fuse)>();
+    /// let mut commands = query.commands(&mut queue);
+    /// for (entity, mut fuse) in query {
+    ///     fuse.0 -= 1;
+    ///     if fuse.0 == 0 {
+    ///         commands.despawn(entity);
+    ///         commands.spawn(Explosion);
+    ///     }
+    /// }
+    /// queue.apply(&mut world);
+    /// assert_eq!(world.query::<&Fuse>().iter().count(), 1);
+    /// assert_eq!(world.query::<&Explosion>().iter().count(), 1);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the queue holds commands recorded for another world.
+    #[track_caller]
+    pub fn commands<'q>(&self, queue: &'q mut CommandQueue) -> Commands<'q>
+    where
+        'w: 'q,
+    {
+        queue.commands(self.world)
     }
 
     /// Iterates over the items of every matching entity, borrowing the query

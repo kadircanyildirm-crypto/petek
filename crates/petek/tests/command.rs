@@ -165,3 +165,43 @@ fn applying_the_same_commands_gives_the_same_world() {
 
     assert_eq!(run(), run());
 }
+
+#[test]
+fn commands_work_alongside_a_mutable_query() {
+    let mut world = World::new();
+    let a = world.spawn((Pos(1), Vel(-1)));
+    let b = world.spawn((Pos(5), Vel(-1)));
+
+    let mut queue = CommandQueue::new();
+    let mut query = world.query_mut::<(Entity, &mut Pos, &Vel)>();
+    let mut commands = query.commands(&mut queue);
+    for (entity, mut pos, vel) in &mut query {
+        pos.0 += vel.0;
+        if pos.0 == 0 {
+            commands.despawn(entity);
+            let child = commands.spawn(Pos(100));
+            commands.insert(child, Vel(0));
+        }
+    }
+    // The query is still usable while the commands wait.
+    assert_eq!(query.iter_mut().count(), 2);
+    queue.apply(&mut world);
+
+    assert!(!world.contains(a));
+    assert_eq!(world.get::<Pos>(b), Some(&Pos(4)));
+    let children: Vec<_> = world.query::<(&Pos, &Vel)>().with::<Vel>().iter().collect();
+    assert!(children.contains(&(&Pos(100), &Vel(0))));
+}
+
+#[test]
+fn an_empty_queue_can_move_between_worlds() {
+    let first = World::new();
+    let mut second = World::new();
+    let mut queue = CommandQueue::new();
+    // Binds the queue to the first world, but records nothing.
+    queue.commands(&first);
+
+    queue.commands(&second).spawn(Pos(1));
+    queue.apply(&mut second);
+    assert_eq!(second.len(), 1);
+}

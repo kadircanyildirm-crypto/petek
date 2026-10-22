@@ -3,7 +3,7 @@
 use std::fmt;
 
 use crate::bundle::Bundle;
-use crate::entity::Entity;
+use crate::entity::{Entities, Entity};
 use crate::resource::Resource;
 use crate::world::{World, WorldId};
 
@@ -15,7 +15,10 @@ type Command = Box<dyn FnOnce(&mut World) + Send>;
 ///
 /// Structural changes, such as spawning entities or adding components, need
 /// exclusive access to the world, so they cannot be made while a query is
-/// running. [`Commands`] record them instead, to be applied once it is done:
+/// running. [`Commands`] record them instead, to be applied once it is done.
+/// They come from [`CommandQueue::commands`] alongside read-only queries, or
+/// from [`Query::commands`](crate::query::Query::commands) alongside any
+/// query:
 ///
 /// ```
 /// use petek::command::CommandQueue;
@@ -32,8 +35,10 @@ type Command = Box<dyn FnOnce(&mut World) + Send>;
 /// let dead = world.spawn(Health(0));
 ///
 /// let mut queue = CommandQueue::new();
-/// let mut commands = queue.commands(&world);
-/// for (entity, health) in world.query::<(Entity, &Health)>() {
+/// let query = world.query_mut::<(Entity, &mut Health)>();
+/// let mut commands = query.commands(&mut queue);
+/// for (entity, mut health) in query {
+///     health.0 = health.0.saturating_sub(5);
 ///     if health.0 == 0 {
 ///         commands.despawn(entity);
 ///         commands.spawn(Corpse);
@@ -46,7 +51,9 @@ type Command = Box<dyn FnOnce(&mut World) + Send>;
 /// ```
 ///
 /// Applying the same commands to the same world always has the same result,
-/// down to the entity handles that are handed out.
+/// down to the entity handles that are handed out, as long as the entities
+/// are reserved in the same order. Reserving entities from several threads at
+/// once is safe, but which thread gets which entity then depends on timing.
 #[derive(Default)]
 pub struct CommandQueue {
     commands: Vec<Command>,
@@ -64,14 +71,21 @@ impl CommandQueue {
     /// Returns a [`Commands`] that records into this queue, and reserves the
     /// entities it spawns in `world`.
     ///
+    /// This borrows the world, so it cannot be used alongside a query that
+    /// writes; see [`Query::commands`](crate::query::Query::commands) for
+    /// that.
+    ///
     /// # Panics
     ///
-    /// If the queue already holds commands recorded for another world.
+    /// If the queue holds commands recorded for another world.
     #[track_caller]
     pub fn commands<'a>(&'a mut self, world: &'a World) -> Commands<'a> {
         self.check_world(world);
         self.world = Some(world.id());
-        Commands { queue: self, world }
+        Commands {
+            queue: self,
+            entities: world.entities(),
+        }
     }
 
     /// Records a command: a function to call with the world when the queue is
@@ -103,8 +117,8 @@ impl CommandQueue {
     ///
     /// # Panics
     ///
-    /// If the commands were recorded for another world, since the entities
-    /// they reserved belong to that world.
+    /// If the queue holds commands recorded for another world, since the
+    /// entities they reserved belong to that world.
     #[track_caller]
     pub fn apply(&mut self, world: &mut World) {
         self.check_world(world);
@@ -115,10 +129,12 @@ impl CommandQueue {
         }
     }
 
+    /// Panics if the queue holds commands recorded for a world other than
+    /// `world`: they may refer to entities reserved in that world.
     #[track_caller]
     fn check_world(&self, world: &World) {
         assert!(
-            self.world.is_none_or(|id| id == world.id()),
+            self.is_empty() || self.world.is_none_or(|id| id == world.id()),
             "a `CommandQueue` was used with a world other than the one its commands were recorded for",
         );
     }
@@ -138,7 +154,9 @@ impl fmt::Debug for CommandQueue {
 /// applied do nothing, and so does removing components an entity lacks.
 pub struct Commands<'a> {
     queue: &'a mut CommandQueue,
-    world: &'a World,
+    /// Used only to reserve entities. Queries never write the entity
+    /// allocator, which is why commands can be used alongside any query.
+    entities: &'a Entities,
 }
 
 impl Commands<'_> {
@@ -146,7 +164,8 @@ impl Commands<'_> {
     /// returns that entity.
     ///
     /// The entity is reserved right away, so it can be used in later
-    /// commands, but it only becomes alive when the queue is applied.
+    /// commands. It becomes alive, without components, at the world's next
+    /// structural change, and gets its components when the queue is applied.
     pub fn spawn<B: Bundle + Send>(&mut self, bundle: B) -> Entity {
         let entity = self.spawn_empty();
         self.insert(entity, bundle);
@@ -161,7 +180,7 @@ impl Commands<'_> {
     /// the world next changes structurally. If the queue is dropped instead,
     /// it becomes alive without components all the same.
     pub fn spawn_empty(&mut self) -> Entity {
-        self.world.reserve_entity()
+        self.entities.reserve()
     }
 
     /// Records adding the components in `bundle` to `entity`, overwriting

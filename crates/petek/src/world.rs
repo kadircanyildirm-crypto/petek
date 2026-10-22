@@ -523,13 +523,6 @@ impl World {
         self.change_tick
     }
 
-    /// Reserves an entity, which becomes alive, without components, at the
-    /// next structural change. See [`Entities::reserve`].
-    #[inline]
-    pub(crate) fn reserve_entity(&self) -> Entity {
-        self.entities.reserve()
-    }
-
     /// Makes reserved entities alive, without components, in the order they
     /// were reserved.
     pub(crate) fn flush(&mut self) {
