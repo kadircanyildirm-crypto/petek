@@ -1,8 +1,13 @@
-//! An archetype-based Entity Component System.
+//! An archetype-based Entity Component System, built for deterministic
+//! simulation.
 //!
 //! Entities are lightweight ids, and components are plain Rust types attached
 //! to them. Entities with the same set of components are stored together in
 //! an *archetype*, with one contiguous column per component.
+//!
+//! Given the same sequence of operations, a world always ends up the same, down
+//! to its entity handles, iteration order and change ticks, as lockstep and
+//! rollback networking require.
 //!
 //! ```
 //! use petek::{Component, World};

@@ -19,7 +19,15 @@ and this project adheres to
 - Queries: `World::query` for read-only queries and `World::query_mut` for
   queries that write, over `&T`, `&mut T`, `Entity`, `Option` and nested
   tuples, with the `With`, `Without` and `Or` filters. `Query::get` and
-  `Query::get_mut` fetch a single entity. Query iterators are exact-size,
-  and `Send` and `Sync`.
+  `Query::get_mut` fetch a single entity. Query iterators are `Send` and
+  `Sync`, and exact-size unless they filter on changes.
 - `QueryState`, which caches the archetypes a query matches between runs.
 - The `QueryError` error type.
+- Resources: unique values stored in the world, outside any entity.
+- Commands: a `CommandQueue` records spawns, inserts, removals, despawns and
+  resource changes to apply later, for example after a query is done, and
+  `Query::commands` lets them be recorded while any query runs. Spawning
+  through commands hands out the new entity right away.
+- Change detection: `Added` and `Changed` query filters, and the `Mut` smart
+  pointer that marks a component as changed when it is written through.
+  Queries for `&mut T` and `World::get_mut` now yield `Mut<T>`.

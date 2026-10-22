@@ -11,12 +11,16 @@ It is meant to be read before the code.
 | `entity.rs` | `Entity` handles and `Entities`, the allocator that tracks generations and where each entity is stored. |
 | `component.rs` | The `Component` trait, `ComponentInfo`, and the per-world `Components` registry. |
 | `bundle.rs` | The `Bundle` trait, its implementations for components and tuples, and the per-world `Bundles` registry. |
-| `storage/blob_vec.rs` | `BlobVec`, a type-erased `Vec` that backs one component column. |
+| `storage/blob_vec.rs` | `BlobVec`, a type-erased `Vec` that holds the values of one component column. |
+| `storage/column.rs` | `Column`: a `BlobVec` plus the tick at which each value was added and last changed. |
 | `storage/mod.rs` | `drop_each`, which keeps dropping values after a destructor panics. |
 | `archetype.rs` | `Archetype` tables, and `Archetypes`: all tables plus the cached `Transition`s between them. |
 | `world.rs` | `World`, the public entry point that ties everything together. |
+| `change.rs` | `Tick`s, and `Mut`, which marks a component as changed when written through. |
+| `resource.rs` | The `Resource` trait and the per-world resource storage. |
+| `command.rs` | `CommandQueue` and `Commands`, which record changes to apply later. |
 | `query/data.rs` | `QueryData`: what a query fetches, implemented for `&T`, `&mut T`, `Entity`, `Option` and tuples. |
-| `query/filter.rs` | `QueryFilter`: `With`, `Without`, `Or` and tuples. |
+| `query/filter.rs` | `QueryFilter`: `With`, `Without`, `Added`, `Changed`, `Or` and tuples. |
 | `query/iter.rs` | `QueryIter`, which walks the matching archetypes row by row. |
 | `query/state.rs` | `QueryState`, which caches the archetypes a query matches. |
 | `query/mod.rs` | `Query`, the access check, and the seal on the query traits. |
@@ -41,12 +45,15 @@ archetype {Position, Velocity}
 
               row 0     row 1     row 2
 entities      e3        e7        e1
-Position      (0, 0)    (4, 2)    (1, 1)    <- BlobVec
-Velocity      (1, 0)    (0, 1)    (2, 2)    <- BlobVec
+Position      (0, 0)    (4, 2)    (1, 1)    <- Column
+Velocity      (1, 0)    (0, 1)    (2, 2)    <- Column
 ```
 
-Columns are `BlobVec`s: contiguous arrays described only by a `Layout` and a
-drop function, so a system iterating over `Position` reads one dense array.
+Each column keeps its values in a `BlobVec`: a contiguous array described only
+by a `Layout` and a drop function, so a system iterating over `Position` reads
+one dense array. Next to the values, in separate arrays, it keeps the tick at
+which each was added and last changed (see [Change detection](#change-detection)),
+so queries that ignore them never touch them.
 For every alive entity, `Entities` records its **location**: the archetype and
 the row it lives in.
 
@@ -134,6 +141,75 @@ archetypes created since the last one.
   correctly. `ReadOnlyQueryData` is sealed separately, as `&mut Local`
   implements `QueryData` and would otherwise be eligible.
 
+## Change detection
+
+Every world has a 64-bit **tick** that moves forward each time it is written
+to: each spawn, insert, `get_mut` and mutable query run gets a new tick. A
+column records, for each value, the tick at which it was added and the tick at
+which it last changed, and the ticks move along with the value when its entity
+changes archetype.
+
+Queries for `&mut T` yield a `Mut<T>`, which stamps the component with the
+query's tick only when it is written through. A `QueryState` remembers the
+tick of its last run, and the `Added<T>` and `Changed<T>` filters let through
+the rows whose tick is newer. So a query sees what others wrote since it last
+ran, but not its own writes. A one-off query has no last run, so to it every
+component counts as added and changed.
+
+Unlike the other filters, these decide row by row, so a query that uses them
+only knows an upper bound on its length. The `ArchetypeFilter` marker trait
+tells the two kinds apart, and only queries whose filters are all archetypal
+are `ExactSizeIterator`.
+
+The ticks are stored in `UnsafeCell`s, since a query writes them through a
+shared reference to the world. That is sound for the same reasons as writing
+the values themselves (see below): a query only writes the ticks of components
+it has exclusive access to. A filter reads a row's tick before the query
+yields that row, never after, so a query can both write `T` and filter on
+`Changed<T>`.
+
+## Commands and reserved entities
+
+Structural changes need `&mut World`, so they cannot happen while a query is
+running. A `CommandQueue` records them instead, as boxed closures, and applies
+them later in the order they were recorded.
+
+`Commands::spawn` returns the new entity right away, through a shared
+reference to the entity allocator. `Entities` hands out such reservations by
+counting an atomic cursor down with a compare-and-swap loop: first over the
+free slots, from the end of the free list, then past the last slot ever used.
+Each caller gets a different count, the loop refuses to move the count past
+the last entity it can hand out, and the free list cannot change while the
+allocator is shared, so no lock is needed. Every structural change starts by
+**flushing**: making the reserved entities alive, without components, in the
+order they were reserved.
+
+Since `Commands` only borrow the entity allocator, which queries never write,
+`Query::commands` hands them out alongside any query, even one that writes.
+A command queue remembers which world it reserved entities in, and panics if
+it is applied to another while it holds commands.
+
+## Determinism
+
+Given the same sequence of operations, a world ends up bit-for-bit the same:
+the same entity handles, the same rows in the same archetypes, and the same
+change ticks. That holds because nothing depends on hash-map iteration order,
+addresses or timing:
+
+- component types, bundles, archetypes and resources are numbered in the order
+  they are first seen, and hash maps are only used for lookups, never iterated
+  over;
+- entity slots are recycled from a stack, and reservations are numbered in the
+  order they are made;
+- queries visit archetypes in the order they were created, and rows in table
+  order, which only depends on the history of the world;
+- ticks only move when the world is written to.
+
+Reserving entities from several threads at once is safe, but which thread
+gets which entity then depends on timing. The planned parallel scheduler will
+keep systems that spawn entities from running at the same time, so that
+worlds stay deterministic even when systems run in parallel.
+
 ## Invariants
 
 The `unsafe` code relies on these invariants:
@@ -141,11 +217,14 @@ The `unsafe` code relies on these invariants:
 1. Every alive entity's location points to an in-bounds row of its archetype,
    and that row records the same entity.
 2. Outside a structural change, every column of an archetype holds exactly as
-   many items as the archetype has entities.
+   many values, and as many of each kind of tick, as the archetype has
+   entities.
 3. Column `i` of an archetype stores values of the type of the archetype's
    `i`-th component id; component ids are sorted and unique.
 4. Each set of components has at most one archetype.
 5. Archetypes are never removed, and their ids never change.
+6. While entity reservations are pending, the free list does not change: every
+   structural change flushes them first.
 
 Debug builds assert invariant 2 after every structural change.
 
@@ -171,5 +250,5 @@ Debug builds assert invariant 2 after every structural change.
 
 ## Not yet implemented
 
-Resources, deferred commands, change detection, systems and a parallel
-scheduler. See the roadmap in the README.
+Snapshots and rollback, world checksums, systems and a parallel scheduler. See
+the roadmap in the README.

@@ -1,6 +1,7 @@
 # petek
 
-An archetype-based Entity Component System (ECS) for Rust.
+An archetype-based Entity Component System (ECS) for Rust, built for
+deterministic simulation.
 
 > **Status:** early development, not ready for use yet.
 
@@ -35,6 +36,29 @@ assert!(world.query::<&Velocity>().into_iter().next().is_none());
 assert_eq!(world.get::<Position>(wall).unwrap().x, 5.0);
 ```
 
+## Determinism
+
+Games with lockstep or rollback networking need every machine to compute the
+same world from the same inputs, bit for bit. `petek` makes that a guarantee
+rather than an accident: given the same sequence of operations, a world hands
+out the same entity handles, iterates in the same order, and records the same
+change ticks.
+
+- No result depends on hash-map iteration order or memory addresses:
+  entities, archetypes, components and resources are numbered in the order
+  they first appear.
+- Commands apply in the order they were recorded, and the entities they spawn
+  are reserved in that order too. Reserving entities from several threads at
+  once is safe, but who gets which entity then depends on timing; the planned
+  scheduler will never run two systems that spawn entities at the same time.
+- Change detection counts writes with a 64-bit tick that only moves when the
+  world is written to, so it cannot wrap around or drift between machines.
+
+Snapshots, rollback, world checksums for spotting desyncs, and a parallel
+scheduler whose results match running systems one after another are next on
+the [roadmap](#roadmap). Keeping floating-point math deterministic across
+platforms remains up to the game.
+
 ## Soundness
 
 `petek` uses `unsafe` code for its type-erased storage, so it is held to a
@@ -61,9 +85,10 @@ strict standard:
 - [x] Type-erased column storage
 - [x] Archetypes and `World`
 - [x] Queries with filters, and cached query state
-- [ ] Resources, commands and change detection
-- [ ] Systems and a parallel scheduler
-- [ ] Events, examples and benchmarks
+- [x] Resources, commands and change detection
+- [ ] Snapshots, rollback and world checksums
+- [ ] Systems and a deterministic parallel scheduler
+- [ ] Events, a rollback demo, benchmarks and derive macros
 
 ## License
 
