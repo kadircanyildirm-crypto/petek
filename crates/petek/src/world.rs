@@ -47,6 +47,9 @@ pub struct World {
     /// The tick at which each system last ran, so that snapshots rewind
     /// systems' change detection along with the world.
     system_ticks: Vec<Tick>,
+    /// Whether a schedule is running systems on the world, through shared
+    /// references, so that some of them have run and others not yet.
+    running_systems: bool,
 }
 
 /// Uniquely identifies a world, so that state computed for one world, such as
@@ -87,6 +90,7 @@ impl World {
             resources: Resources::default(),
             change_tick: AtomicTick::new(Tick::ZERO),
             system_ticks: Vec::new(),
+            running_systems: false,
         }
     }
 
@@ -588,15 +592,26 @@ impl World {
     /// spawned yet panics: restoring such a snapshot would bring back the
     /// reservations without the commands that fill them.
     ///
+    /// For the same reason, take snapshots between the runs of a
+    /// [`Schedule`](crate::schedule::Schedule), or from an exclusive system,
+    /// and not from a system that reads the world while others run: some of
+    /// them would have run, and their commands and last runs would be missing
+    /// from the snapshot.
+    ///
     /// # Panics
     ///
     /// If the world holds a component or resource whose type is not
-    /// registered, or if entities reserved by commands are waiting to be
-    /// spawned. If cloning a component or resource panics, the panic is
-    /// passed on.
+    /// registered, if entities reserved by commands are waiting to be
+    /// spawned, or if a schedule is running systems on the world. If cloning
+    /// a component or resource panics, the panic is passed on.
     #[must_use]
     #[track_caller]
     pub fn snapshot(&self) -> Snapshot {
+        assert!(
+            !self.running_systems,
+            "cannot snapshot a world while a schedule runs systems on it: take snapshots \
+             between runs, or from an exclusive system",
+        );
         // Checking the copy rather than the world means that reservations
         // made meanwhile on other threads cannot slip in.
         let mut entities = self.entities.clone();
@@ -816,6 +831,18 @@ impl World {
         self.change_tick.set(tick);
     }
 
+    /// Records whether a schedule is running systems on the world.
+    #[inline]
+    pub(crate) fn set_running_systems(&mut self, running: bool) {
+        self.running_systems = running;
+    }
+
+    /// Gives up every pending entity reservation; see
+    /// [`Entities::cancel_reservations`].
+    pub(crate) fn cancel_reservations(&mut self) {
+        self.entities.cancel_reservations();
+    }
+
     /// Makes room for the ticks of a new system, which has never run, and
     /// returns where they are kept.
     pub(crate) fn add_system_ticks(&mut self) -> usize {
@@ -920,6 +947,9 @@ impl World {
         tick: Tick,
     ) -> Entity {
         self.flush();
+        // Checking up front keeps the bundle from being leaked, staged in the
+        // columns, if no entity is left to hand out.
+        self.entities.check_room();
         let (transition, empty, target) = self.archetypes.split(transition);
         let archetype = target.unwrap_or(empty);
         archetype.reserve(1);

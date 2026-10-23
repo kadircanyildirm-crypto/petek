@@ -411,6 +411,40 @@ fn the_order_of_conflicting_systems_is_kept() {
 }
 
 #[test]
+#[should_panic(expected = "cannot snapshot a world while a schedule runs systems on it")]
+fn snapshots_are_not_taken_while_systems_run() {
+    // Earlier systems of the same run would not remember running yet.
+    run_once(&mut World::new(), |world: &World| {
+        let _ = world.snapshot();
+    });
+}
+
+#[test]
+fn snapshots_can_be_taken_by_exclusive_systems() {
+    let mut world = World::new();
+    world.register_clone::<Pos>();
+    world.spawn(Pos(1));
+    let saved = Arc::new(Mutex::new(None));
+    let save = saved.clone();
+    run_once(&mut world, move |world: &mut World| {
+        *save.lock().unwrap() = Some(world.snapshot());
+    });
+    world.spawn(Pos(2));
+    world.restore(saved.lock().unwrap().as_ref().unwrap());
+    assert_eq!(world.len(), 1);
+}
+
+#[test]
+#[should_panic(expected = "run with a world other than the one it first ran with")]
+fn systems_cannot_swap_the_world_for_another() {
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(|world: &mut World| *world = World::new())
+        .add_system(|_: Query<&Pos>| {});
+    schedule.run(&mut World::new());
+}
+
+#[test]
 #[should_panic(expected = "run with a world other than the one it first ran with")]
 fn schedules_belong_to_one_world() {
     let mut schedule = Schedule::new();

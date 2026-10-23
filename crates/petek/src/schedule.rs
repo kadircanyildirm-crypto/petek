@@ -87,9 +87,6 @@ pub struct Schedule {
     /// The threads, other than the caller's, that run systems in parallel,
     /// spawned when first needed and kept between runs.
     pool: Option<Pool>,
-    /// Whether the last run panicked, leaving behind what systems deferred
-    /// during a frame that never finished.
-    interrupted: bool,
 }
 
 /// A part of a schedule's run.
@@ -127,7 +124,6 @@ impl Schedule {
             plan: Vec::new(),
             threads: thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
             pool: None,
-            interrupted: false,
         }
     }
 
@@ -174,30 +170,45 @@ impl Schedule {
 
     /// Runs every system once, then applies their commands.
     ///
+    /// Running a schedule is a structural change: entities reserved before
+    /// it become alive, without components, when it starts.
+    ///
     /// # Panics
     ///
-    /// If the schedule ran with another world before, if the parameters of
-    /// a system conflict, or if a system or a command panics.
+    /// If the schedule ran with another world before, if a system or command
+    /// puts another world in its place, if the parameters of a system
+    /// conflict, or if a system or a command panics.
     ///
     /// In the last case, which other systems ran is unspecified, but the
     /// world stays consistent, and the systems that finished remember
-    /// running. The commands recorded during that run are dropped without
-    /// being applied the next time the schedule runs: they belong to a frame
-    /// that never finished, and a game that recovers by restoring a snapshot
-    /// should not see them applied to the next one.
+    /// running. The commands recorded during the run that were not applied
+    /// yet are dropped, and the entities they reserved never become alive:
+    /// the run belongs to a frame that never finished, which a game would
+    /// recover from by restoring a snapshot.
     #[track_caller]
     pub fn run(&mut self, world: &mut World) {
         self.initialize(world);
-        if self.interrupted {
+        // From now on, the reservations pending are the run's own, so they
+        // can be given up if it panics.
+        world.flush();
+        let result = panic::catch_unwind(AssertUnwindSafe(|| self.run_phases(world)));
+        if let Err(payload) = result {
             for system in &mut self.systems {
                 system.discard_deferred();
             }
+            world.cancel_reservations();
+            panic::resume_unwind(payload);
         }
-        self.interrupted = true;
-        // Commands are applied in the order of the systems that recorded
-        // them, up to the next exclusive system or the end.
+    }
+
+    /// Runs the phases of the plan, applying commands in the order of the
+    /// systems that recorded them, before each exclusive system and at the
+    /// end.
+    fn run_phases(&mut self, world: &mut World) {
+        let id = self.world.expect("the schedule is initialized");
         let mut applied = 0;
         for phase in &self.plan {
+            check_world(id, world);
             match phase {
                 Phase::Shared(phase) => {
                     let threads = self.threads.get();
@@ -208,12 +219,13 @@ impl Schedule {
                 &Phase::Exclusive(index) => {
                     apply_deferred(&mut self.systems[applied..index], world);
                     applied = index;
+                    check_world(id, world);
                     self.systems[index].run_exclusive(world);
                 }
             }
         }
+        check_world(id, world);
         apply_deferred(&mut self.systems[applied..], world);
-        self.interrupted = false;
     }
 
     /// Initializes the systems added since the last run, and plans how to
@@ -308,6 +320,7 @@ fn run_shared(
         })
         .collect();
 
+    world.set_running_systems(true);
     let world_ref: &World = world;
     let outcome = match pool {
         Some(pool) => run_parallel(systems, phase, world_ref, &ticks, pool),
@@ -316,6 +329,7 @@ fn run_shared(
 
     // Whether or not a system panicked, the world's tick ends up past every
     // system of the phase, and the systems that finished remember running.
+    world.set_running_systems(false);
     world.set_change_tick(start.after(len));
     for ((system, ticks), &finished) in systems.iter().zip(ticks).zip(&outcome.finished) {
         if finished {
@@ -484,6 +498,16 @@ fn run_parallel(
 /// runs, except for the system being run, which is not run again.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Panics if a system or command has put another world in place of the one
+/// with id `id`, which the schedule's systems belong to.
+#[track_caller]
+fn check_world(id: WorldId, world: &World) {
+    assert!(
+        world.id() == id,
+        "a `Schedule` was run with a world other than the one it first ran with",
+    );
 }
 
 /// Applies what `systems` deferred, in order.

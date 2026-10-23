@@ -194,6 +194,20 @@ fn commands_work_alongside_a_mutable_query() {
 }
 
 #[test]
+#[should_panic(
+    expected = "a command put another world in place of the one its queue was applied to"
+)]
+fn commands_cannot_swap_the_world_for_another() {
+    let mut world = World::new();
+    let mut queue = CommandQueue::new();
+    let mut commands = queue.commands(&world);
+    commands.add(|world| *world = World::new());
+    // Recorded for the first world, it would hit an unrelated entity.
+    commands.spawn(Pos(1));
+    queue.apply(&mut world);
+}
+
+#[test]
 fn an_empty_queue_can_move_between_worlds() {
     let first = World::new();
     let mut second = World::new();

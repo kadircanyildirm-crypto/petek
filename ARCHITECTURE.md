@@ -273,10 +273,19 @@ become ready, under one mutex, and wait on a condition variable otherwise.
 Each system sits behind a mutex of its own, so the threads can share the list
 while each system is only ever run by one of them. A panicking system is
 caught, stops the others from starting, and is passed on once those running
-have finished. The systems that finished still remember running, and the
-commands recorded during the run are dropped when the schedule next runs:
-they belong to a frame that never finished, and a game that recovers by
-restoring a snapshot must not see them applied to the next one.
+have finished. The systems that finished still remember running. The
+commands recorded during the run that were not applied yet are dropped, and
+the entities they reserved are given up: they belong to a frame that never
+finished, and a game that recovers by restoring a snapshot must not see them
+applied to the next one. For the reservations given up to be the run's own,
+a run starts by flushing the reservations made before it.
+
+A world knows when a schedule is running systems on it, and refuses to be
+snapshotted then: some systems of the run would have run and others not, and
+the snapshot would hold neither the last runs of the first, nor their
+commands. Snapshots are taken between runs, or from exclusive systems. A
+schedule also checks before each phase that no exclusive system or command
+has put another world in place of its own.
 
 Writes through a shared world are sound because the scheduler only runs a
 system alongside systems it does not conflict with. Resources sit in

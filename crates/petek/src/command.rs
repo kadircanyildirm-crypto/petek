@@ -134,7 +134,14 @@ impl CommandQueue {
         self.check_world(world);
         self.world = None;
         world.flush();
+        let id = world.id();
         for command in self.commands.drain(..) {
+            // A command may put another world in place of this one, which
+            // the rest do not belong to.
+            assert!(
+                world.id() == id,
+                "a command put another world in place of the one its queue was applied to",
+            );
             command(world);
         }
     }

@@ -239,7 +239,11 @@ where
             .state
             .as_mut()
             .expect("the system is initialized before it runs");
-        debug_assert_eq!(state.world, world.id());
+        assert!(
+            state.world == world.id(),
+            "system `{}` was run with a world other than the one it was first run with",
+            state.meta.name(),
+        );
         let run = SystemRun {
             name: state.meta.name(),
             ticks,

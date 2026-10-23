@@ -183,6 +183,22 @@ impl Entities {
         Some(location)
     }
 
+    /// Panics if there are no entities left to hand out, so that callers can
+    /// check before [`alloc`](Self::alloc) would.
+    pub(crate) fn check_room(&self) {
+        assert!(
+            !self.free.is_empty() || u32::try_from(self.meta.len()).is_ok(),
+            "too many entities",
+        );
+    }
+
+    /// Gives up every pending reservation: the reserved entities never become
+    /// alive, and their slots may be handed out again, with the same
+    /// generations.
+    pub(crate) fn cancel_reservations(&mut self) {
+        self.sync_unreserved();
+    }
+
     /// Frees every alive entity. No reservations may be pending.
     pub(crate) fn clear(&mut self) {
         debug_assert_eq!(self.pending(), 0, "reserved entities must be flushed first");

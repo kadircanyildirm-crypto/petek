@@ -299,6 +299,32 @@ fn commands_of_a_run_that_panicked_are_dropped() {
 }
 
 #[test]
+fn a_run_that_panicked_gives_up_its_reservations() {
+    static FAIL: AtomicBool = AtomicBool::new(true);
+
+    let mut world = World::new();
+    world.register_clone::<B>();
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(|mut commands: Commands| {
+            commands.spawn(B(1));
+        })
+        .add_system(|query: Query<&B>| {
+            assert!(!FAIL.swap(false, Ordering::Relaxed), "boom");
+            let _ = query.iter().count();
+        });
+    let result = panic::catch_unwind(AssertUnwindSafe(|| schedule.run(&mut world)));
+    assert!(result.is_err());
+
+    // Nothing of that run is left: no reservation keeps the world from being
+    // snapshotted, and no entity without components comes alive.
+    let _ = world.snapshot();
+    schedule.run(&mut world);
+    assert_eq!(world.len(), 1);
+    assert_eq!(world.query::<&B>().iter().count(), 1);
+}
+
+#[test]
 fn a_panicking_system_does_not_hang_the_schedule() {
     static FAIL: AtomicBool = AtomicBool::new(true);
 
