@@ -510,7 +510,7 @@ mod tests {
         assert!(entities.contains(b));
         assert_eq!(entities.len(), 4);
         assert_eq!(entities.pending(), 0);
-        assert!(flush(&mut entities).is_empty());
+        assert_eq!(flush(&mut entities), Vec::<Entity>::new());
 
         // Allocation carries on where the reservations left off.
         assert_eq!(entities.alloc(HERE).index(), 4);
