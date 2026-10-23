@@ -52,24 +52,27 @@ fn moving(i: usize) -> (Position, Velocity) {
     (Position(x, x, x), Velocity(1.0, 0.5, 0.25))
 }
 
+/// Spawns entities into a new world, and drops it, as programs do. Keeping
+/// the worlds instead, as `iter_with_large_drop` does, piles up so many that
+/// the cost of fresh memory pages swamps that of spawning.
 fn spawn(c: &mut Criterion) {
     let mut group = c.benchmark_group("spawn");
     group.bench_function("petek", |b| {
-        b.iter_with_large_drop(|| {
+        b.iter(|| {
             let mut world = petek::World::new();
             world.spawn_batch((0..ENTITIES).map(moving)).for_each(drop);
             world
         });
     });
     group.bench_function("hecs", |b| {
-        b.iter_with_large_drop(|| {
+        b.iter(|| {
             let mut world = hecs::World::new();
             world.spawn_batch((0..ENTITIES).map(moving)).for_each(drop);
             world
         });
     });
     group.bench_function("bevy_ecs", |b| {
-        b.iter_with_large_drop(|| {
+        b.iter(|| {
             let mut world = bevy_ecs::world::World::new();
             world.spawn_batch((0..ENTITIES).map(moving)).for_each(drop);
             world
