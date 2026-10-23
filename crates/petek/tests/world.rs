@@ -188,30 +188,33 @@ fn forged_and_stale_handles_are_rejected() {
 }
 
 /// The components the model expects an entity to have.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Expected {
     pos: Option<Pos>,
     vel: Option<Vel>,
     name: Option<Name>,
 }
 
+/// What the model expects the world to hold.
+#[derive(Clone, Default)]
+struct Model {
+    alive: Vec<(Entity, Expected)>,
+    /// Entities that must not be alive.
+    dead: Vec<Entity>,
+}
+
 /// The query that [`check`] runs both once and through a cached state.
 type Checked = (Entity, &'static Pos, Option<&'static Name>);
 
 /// Checks the world against the model.
-fn check(
-    world: &World,
-    state: &mut QueryState<Checked, Without<Vel>>,
-    alive: &[(Entity, Expected)],
-    dead: &[Entity],
-) {
-    assert_eq!(world.len(), alive.len());
-    for (entity, expected) in alive {
+fn check(world: &World, state: &mut QueryState<Checked, Without<Vel>>, model: &Model) {
+    assert_eq!(world.len(), model.alive.len());
+    for (entity, expected) in &model.alive {
         assert_eq!(world.get::<Pos>(*entity), expected.pos.as_ref());
         assert_eq!(world.get::<Vel>(*entity), expected.vel.as_ref());
         assert_eq!(world.get::<Name>(*entity), expected.name.as_ref());
     }
-    assert!(dead.iter().all(|&entity| !world.contains(entity)));
+    assert!(model.dead.iter().all(|&entity| !world.contains(entity)));
 
     // A query visits every entity that has the components exactly once,
     // whether it runs once or through a state that caches the archetypes.
@@ -226,7 +229,8 @@ fn check(
     let mut cached: Vec<_> = state.iter(world).map(items).collect();
     cached.sort_by_key(|&(entity, ..)| entity);
     assert_eq!(cached, queried);
-    let mut expected: Vec<_> = alive
+    let mut expected: Vec<_> = model
+        .alive
         .iter()
         .filter(|(_, expected)| expected.vel.is_none())
         .filter_map(|(entity, expected)| {
@@ -238,96 +242,132 @@ fn check(
     assert_eq!(queried, expected);
 }
 
-/// Applies a reproducible pseudo-random mix of operations and checks the
-/// world against a straightforward model after every batch of them.
+/// Applies a pseudo-random operation to both the world and the model.
+fn apply_random_operation(
+    world: &mut World,
+    model: &mut Model,
+    random: &mut impl FnMut(usize) -> usize,
+    value: i32,
+) {
+    let alive = &mut model.alive;
+    let target = (!alive.is_empty()).then(|| random(alive.len()));
+    match (random(8), target) {
+        (0, _) | (_, None) => {
+            let entity = world.spawn((Pos(value), Vel(-value)));
+            let expected = Expected {
+                pos: Some(Pos(value)),
+                vel: Some(Vel(-value)),
+                name: None,
+            };
+            alive.push((entity, expected));
+        }
+        (1, _) => {
+            let entity = world.spawn(Name(value.to_string()));
+            let expected = Expected {
+                name: Some(Name(value.to_string())),
+                ..Expected::default()
+            };
+            alive.push((entity, expected));
+        }
+        (2, Some(i)) => {
+            let (entity, _) = alive.swap_remove(i);
+            world.despawn(entity).unwrap();
+            model.dead.push(entity);
+        }
+        (3, Some(i)) => {
+            let (entity, expected) = &mut alive[i];
+            world.insert(*entity, Name(value.to_string())).unwrap();
+            expected.name = Some(Name(value.to_string()));
+        }
+        (4, Some(i)) => {
+            let (entity, expected) = &mut alive[i];
+            world.insert(*entity, (Vel(value), Pos(value))).unwrap();
+            expected.vel = Some(Vel(value));
+            expected.pos = Some(Pos(value));
+        }
+        (5, Some(i)) => {
+            let (entity, expected) = &mut alive[i];
+            assert_eq!(world.remove::<Pos>(*entity).ok(), expected.pos.take());
+        }
+        (6, Some(_)) if value % 1000 == 999 => {
+            world.clear();
+            model.dead.extend(alive.drain(..).map(|(entity, _)| entity));
+        }
+        (6, Some(_)) => {
+            for (mut pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
+                pos.0 = pos.0.wrapping_add(vel.0);
+            }
+            for (_, expected) in alive {
+                if let (Some(pos), Some(vel)) = (&mut expected.pos, &expected.vel) {
+                    pos.0 = pos.0.wrapping_add(vel.0);
+                }
+            }
+        }
+        (_, Some(i)) => {
+            let (entity, expected) = &mut alive[i];
+            let removed = world.remove::<(Name, Vel)>(*entity).ok();
+            if expected.name.is_some() && expected.vel.is_some() {
+                let expected = (expected.name.take(), expected.vel.take());
+                assert_eq!(
+                    removed.map(|(name, vel)| (Some(name), Some(vel))),
+                    Some(expected)
+                );
+            } else {
+                assert_eq!(removed, None);
+            }
+        }
+    }
+}
+
+/// Applies a reproducible pseudo-random mix of operations, including taking
+/// and restoring snapshots, and checks the world against a straightforward
+/// model after every batch of them.
 #[test]
 fn matches_a_model_under_random_operations() {
     // A tiny xorshift generator keeps the test reproducible without a
     // dependency.
-    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
     let mut random = |n: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        usize::try_from(state % n as u64).unwrap()
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        usize::try_from(seed % n as u64).unwrap()
     };
 
     let mut world = World::new();
+    world.register_clone::<Pos>();
+    world.register_clone::<Vel>();
+    world.register_clone::<Name>();
     let mut state = QueryState::new(&mut world);
-    let mut alive: Vec<(Entity, Expected)> = Vec::new();
-    let mut dead = Vec::new();
+    let mut model = Model::default();
+    // Restoring the empty world removes every archetype, which the cached
+    // query state must notice.
+    let empty = world.snapshot();
+    let mut saved = None;
     let steps = if cfg!(miri) { 400 } else { 10_000 };
     for value in 0..steps {
-        let target = (!alive.is_empty()).then(|| random(alive.len()));
-        match (random(8), target) {
-            (0, _) | (_, None) => {
-                let entity = world.spawn((Pos(value), Vel(-value)));
-                let expected = Expected {
-                    pos: Some(Pos(value)),
-                    vel: Some(Vel(-value)),
-                    name: None,
-                };
-                alive.push((entity, expected));
-            }
-            (1, _) => {
-                let entity = world.spawn(Name(value.to_string()));
-                let expected = Expected {
-                    name: Some(Name(value.to_string())),
-                    ..Expected::default()
-                };
-                alive.push((entity, expected));
-            }
-            (2, Some(i)) => {
-                let (entity, _) = alive.swap_remove(i);
-                world.despawn(entity).unwrap();
-                dead.push(entity);
-            }
-            (3, Some(i)) => {
-                let (entity, expected) = &mut alive[i];
-                world.insert(*entity, Name(value.to_string())).unwrap();
-                expected.name = Some(Name(value.to_string()));
-            }
-            (4, Some(i)) => {
-                let (entity, expected) = &mut alive[i];
-                world.insert(*entity, (Vel(value), Pos(value))).unwrap();
-                expected.vel = Some(Vel(value));
-                expected.pos = Some(Pos(value));
-            }
-            (5, Some(i)) => {
-                let (entity, expected) = &mut alive[i];
-                assert_eq!(world.remove::<Pos>(*entity).ok(), expected.pos.take());
-            }
-            (6, Some(_)) if value % 1000 == 999 => {
-                world.clear();
-                dead.extend(alive.drain(..).map(|(entity, _)| entity));
-            }
-            (6, Some(_)) => {
-                for (mut pos, vel) in world.query_mut::<(&mut Pos, &Vel)>() {
-                    pos.0 = pos.0.wrapping_add(vel.0);
-                }
-                for (_, expected) in &mut alive {
-                    if let (Some(pos), Some(vel)) = (&mut expected.pos, &expected.vel) {
-                        pos.0 = pos.0.wrapping_add(vel.0);
-                    }
+        match random(500) {
+            0..5 => saved = Some((world.snapshot(), model.clone())),
+            5..10 => {
+                if let Some((snapshot, then)) = &saved {
+                    world.restore(snapshot);
+                    // Entities spawned since the snapshot may be handed out
+                    // again, so only those dead back then must stay dead.
+                    model.clone_from(then);
+                    check(&world, &mut state, &model);
                 }
             }
-            (_, Some(i)) => {
-                let (entity, expected) = &mut alive[i];
-                let removed = world.remove::<(Name, Vel)>(*entity).ok();
-                if expected.name.is_some() && expected.vel.is_some() {
-                    let expected = (expected.name.take(), expected.vel.take());
-                    assert_eq!(
-                        removed.map(|(name, vel)| (Some(name), Some(vel))),
-                        Some(expected)
-                    );
-                } else {
-                    assert_eq!(removed, None);
-                }
+            10 => {
+                world.restore(&empty);
+                model = Model::default();
+                check(&world, &mut state, &model);
             }
+            _ => {}
         }
+        apply_random_operation(&mut world, &mut model, &mut random, value);
         if value % 100 == 0 {
-            check(&world, &mut state, &alive, &dead);
+            check(&world, &mut state, &model);
         }
     }
-    check(&world, &mut state, &alive, &dead);
+    check(&world, &mut state, &model);
 }

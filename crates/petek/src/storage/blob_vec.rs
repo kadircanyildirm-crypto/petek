@@ -3,6 +3,7 @@
 use std::alloc::{self, Layout};
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
+use std::slice;
 
 use super::drop_each;
 
@@ -21,6 +22,54 @@ pub(crate) fn drop_fn_of<T>() -> Option<DropFn> {
         unsafe { ptr.cast::<T>().drop_in_place() }
     }
     mem::needs_drop::<T>().then_some(drop_ptr::<T> as DropFn)
+}
+
+/// Clones values through type-erased pointers: `len` of them from `src` into
+/// the uninitialized memory at `dst`, which then owns the clones.
+///
+/// If a clone panics, the clones made so far are dropped, and `dst` is left
+/// uninitialized.
+///
+/// # Safety
+///
+/// `src` must point to `len` valid values of the type the function was created
+/// for, and `dst` must be valid for writing `len` of them, without overlapping
+/// `src`.
+pub(crate) type CloneFn = unsafe fn(src: NonNull<u8>, dst: NonNull<u8>, len: usize);
+
+/// Returns the [`CloneFn`] for `T`.
+pub(crate) fn clone_fn_of<T: Clone>() -> CloneFn {
+    unsafe fn clone_items<T: Clone>(src: NonNull<u8>, dst: NonNull<u8>, len: usize) {
+        /// Drops the clones written so far when dropped, which only happens
+        /// if a clone panics.
+        struct Written<T> {
+            dst: NonNull<T>,
+            len: usize,
+        }
+
+        impl<T> Drop for Written<T> {
+            fn drop(&mut self) {
+                // SAFETY: the first `len` slots of `dst` hold clones that
+                // nothing else owns.
+                unsafe { NonNull::slice_from_raw_parts(self.dst, self.len).drop_in_place() };
+            }
+        }
+
+        // SAFETY: the caller guarantees `src` points to `len` valid `T`s.
+        let src = unsafe { slice::from_raw_parts(src.cast::<T>().as_ptr(), len) };
+        let mut written = Written {
+            dst: dst.cast::<T>(),
+            len: 0,
+        };
+        for item in src {
+            // SAFETY: the caller guarantees `dst` has room for `len` `T`s, and
+            // fewer than `len` have been written so far.
+            unsafe { written.dst.add(written.len).write(item.clone()) };
+            written.len += 1;
+        }
+        mem::forget(written);
+    }
+    clone_items::<T>
 }
 
 /// A growable array of items described only by a [`Layout`] and a [`DropFn`].
@@ -293,6 +342,33 @@ impl BlobVec {
         self.len = last;
     }
 
+    /// Returns a copy of this vector, with each item cloned by `clone`.
+    ///
+    /// If a clone panics, the clones made so far are dropped.
+    ///
+    /// # Panics
+    ///
+    /// If `clone` is `None` and the vector is not empty.
+    ///
+    /// # Safety
+    ///
+    /// `clone` must clone this vector's item type, and no one may be writing
+    /// the items while this runs.
+    pub(crate) unsafe fn clone_with(&self, clone: Option<CloneFn>) -> Self {
+        let mut copy = Self::new(self.item_layout, self.drop);
+        if self.len > 0 {
+            let clone = clone.expect("a non-empty vector needs a clone function to be copied");
+            copy.reserve(self.len);
+            // SAFETY: the first `len` items are valid and no one is writing
+            // them, `copy` has room for as many in a separate allocation, and
+            // `clone` clones their type. `copy` only counts the clones once
+            // they all exist.
+            unsafe { clone(self.data, copy.data, self.len) };
+            copy.len = self.len;
+        }
+        copy
+    }
+
     /// Drops all items, keeping the allocation.
     pub(crate) fn clear(&mut self) {
         // With `len` already zero, no item can be dropped twice, even if a
@@ -442,6 +518,15 @@ mod tests {
             dst.0.reserve(1);
             // SAFETY: `index` is in bounds, and `dst` stores `T` and has room.
             unsafe { self.0.swap_remove_into_unchecked(index, &mut dst.0) }
+        }
+
+        fn clone(&self) -> Self
+        where
+            T: Clone,
+        {
+            // SAFETY: the function clones `T`s, and `&self` rules out writes.
+            let copy = unsafe { self.0.clone_with(Some(clone_fn_of::<T>())) };
+            Self(copy, PhantomData)
         }
     }
 
@@ -603,9 +688,61 @@ mod tests {
     }
 
     #[test]
+    fn clones_are_independent_copies() {
+        let mut vec = Typed::<String>::new();
+        for word in ["a", "b", "c"] {
+            vec.push(word.to_owned());
+        }
+        let mut copy = vec.clone();
+        copy.get_mut(0).push('!');
+        vec.swap_remove_and_drop(2);
+        assert_eq!([vec.get(0), vec.get(1)], ["a", "b"]);
+        assert_eq!([copy.get(0), copy.get(1), copy.get(2)], ["a!", "b", "c"]);
+        // The copy can grow like any other vector.
+        copy.push("d".to_owned());
+        assert_eq!(copy.len(), 4);
+    }
+
+    #[test]
+    fn empty_vectors_need_no_clone_function() {
+        let vec = Typed::<String>::new();
+        // SAFETY: there are no items, so there is nothing to clone wrongly.
+        let copy = unsafe { vec.0.clone_with(None) };
+        assert_eq!(copy.len(), 0);
+    }
+
+    #[test]
+    fn a_panicking_clone_drops_the_clones_made_so_far() {
+        /// Panics when cloned, if it is the one marked to.
+        struct Fragile(Tracked);
+
+        impl Clone for Fragile {
+            fn clone(&self) -> Self {
+                assert_ne!(self.0.id, 3, "Fragile(3) panicked on clone");
+                Self(Tracked::new(self.0.id, &self.0.drops))
+            }
+        }
+
+        let drops = Rc::new(Cell::new(0));
+        let mut vec = Typed::new();
+        for id in 0..5 {
+            vec.push(Fragile(Tracked::new(id, &drops)));
+        }
+
+        // Miri reports a leak if the clones or the allocation are not freed.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| vec.clone()));
+        assert!(result.is_err());
+        assert_eq!(drops.get(), 3);
+        assert_eq!(vec.len(), 5);
+        drop(vec);
+        assert_eq!(drops.get(), 8);
+    }
+
+    #[test]
     fn zero_sized_items() {
         static DROPS: AtomicUsize = AtomicUsize::new(0);
 
+        #[derive(Clone)]
         struct Zst;
 
         impl Drop for Zst {
@@ -625,10 +762,12 @@ mod tests {
         vec.swap_remove_into(0, &mut other);
         assert_eq!((vec.len(), other.len()), (997, 1));
         assert_eq!(DROPS.load(Ordering::Relaxed), 3);
+        drop(vec.clone());
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1000);
 
         drop(vec);
         drop(other);
-        assert_eq!(DROPS.load(Ordering::Relaxed), 1001);
+        assert_eq!(DROPS.load(Ordering::Relaxed), 1998);
     }
 
     #[test]

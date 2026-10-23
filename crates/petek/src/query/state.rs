@@ -48,14 +48,21 @@ use crate::world::{World, WorldId};
 ///
 /// A `QueryState` belongs to the world it was created for, and using it with
 /// another world panics.
+///
+/// It is not part of the world, so [restoring](World::restore) a snapshot of
+/// the world does not rewind it. Its [`Added`](super::Added) and
+/// [`Changed`](super::Changed) filters may then see too little, since it
+/// remembers running at a tick the world has not reached again yet. To roll
+/// it back too, keep a clone of it alongside the snapshot.
 pub struct QueryState<D: QueryData, F: QueryFilter = ()> {
     world: WorldId,
     data: D::State,
     filter: F::State,
     /// The matching archetypes among the first `checked` archetypes of the
-    /// world.
+    /// world, when its archetype epoch was `epoch`.
     matched: Vec<ArchetypeId>,
     checked: usize,
+    epoch: u64,
     /// The world's tick when the query last ran; what is newer counts as
     /// added or changed.
     last_run: Tick,
@@ -81,6 +88,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             filter,
             matched: Vec::new(),
             checked: 0,
+            epoch: world.archetypes().epoch(),
             last_run: Tick::ZERO,
         }
     }
@@ -205,14 +213,20 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
 
     /// Checks the archetypes created since the last update.
     ///
-    /// Archetypes are never removed, so earlier results stay valid.
+    /// Earlier results stay valid unless archetypes were removed since, which
+    /// changes the world's archetype epoch. Everything is checked again then.
     #[track_caller]
     fn update(&mut self, world: &World) {
         self.check_world(world);
+        let archetypes = world.archetypes();
+        if self.epoch != archetypes.epoch() {
+            self.matched.clear();
+            self.checked = 0;
+            self.epoch = archetypes.epoch();
+        }
         // Reserving first means that pushing cannot panic halfway, which
         // would leave archetypes listed but not counted as checked, and so
         // listed twice after the next update.
-        let archetypes = world.archetypes();
         self.matched.reserve(archetypes.len() - self.checked);
         for (id, archetype) in archetypes.iter_from(self.checked) {
             if D::matches(&self.data, archetype) && F::matches(&self.filter, archetype) {
@@ -230,6 +244,20 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
             world.id() == self.world,
             "a `QueryState` was used with a world other than the one it was created for",
         );
+    }
+}
+
+impl<D: QueryData, F: QueryFilter> Clone for QueryState<D, F> {
+    fn clone(&self) -> Self {
+        Self {
+            world: self.world,
+            data: self.data,
+            filter: self.filter,
+            matched: self.matched.clone(),
+            checked: self.checked,
+            epoch: self.epoch,
+            last_run: self.last_run,
+        }
     }
 }
 

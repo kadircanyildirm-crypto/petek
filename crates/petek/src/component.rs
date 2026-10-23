@@ -4,7 +4,7 @@ use std::alloc::Layout;
 use std::any::{TypeId, type_name};
 
 use crate::hash::FastHashMap;
-use crate::storage::blob_vec::{DropFn, drop_fn_of};
+use crate::storage::blob_vec::{CloneFn, DropFn, clone_fn_of, drop_fn_of};
 
 /// Data that can be attached to an entity.
 ///
@@ -93,6 +93,8 @@ impl ComponentInfo {
 #[derive(Debug)]
 pub struct Components {
     infos: Vec<ComponentInfo>,
+    /// How to clone each component type, if it is registered for snapshots.
+    clone_fns: Vec<Option<CloneFn>>,
     ids: FastHashMap<TypeId, ComponentId>,
 }
 
@@ -100,6 +102,7 @@ impl Components {
     pub(crate) fn new() -> Self {
         Self {
             infos: Vec::new(),
+            clone_fns: Vec::new(),
             ids: FastHashMap::default(),
         }
     }
@@ -110,8 +113,21 @@ impl Components {
         *self.ids.entry(info.type_id).or_insert_with(|| {
             let id = u32::try_from(self.infos.len()).expect("too many component types");
             self.infos.push(info);
+            self.clone_fns.push(None);
             ComponentId(id)
         })
+    }
+
+    /// Registers `C` for snapshots, which copy it with `Clone`.
+    pub(crate) fn register_clone<C: Component + Clone>(&mut self) {
+        let id = self.register(ComponentInfo::of::<C>());
+        self.clone_fns[id.0 as usize] = Some(clone_fn_of::<C>());
+    }
+
+    /// How to clone component `id`, if it is registered for snapshots.
+    #[inline]
+    pub(crate) fn clone_fn(&self, id: ComponentId) -> Option<CloneFn> {
+        self.clone_fns[id.0 as usize]
     }
 
     /// Returns the id of a component type, if it has been registered.
@@ -161,5 +177,19 @@ mod tests {
         assert_eq!(components.id(TypeId::of::<Name>()), Some(name));
         assert_eq!(components.id(TypeId::of::<u8>()), None);
         assert_eq!(components.info(name).type_id(), TypeId::of::<Name>());
+    }
+
+    #[test]
+    fn registering_for_snapshots_keeps_the_id() {
+        #[derive(Clone)]
+        struct Health;
+        impl Component for Health {}
+
+        let mut components = Components::new();
+        let health = components.register(ComponentInfo::of::<Health>());
+        assert!(components.clone_fn(health).is_none());
+        components.register_clone::<Health>();
+        assert_eq!(components.id(TypeId::of::<Health>()), Some(health));
+        assert!(components.clone_fn(health).is_some());
     }
 }

@@ -324,6 +324,29 @@ impl Entities {
     }
 }
 
+/// Copies the allocator, with its pending reservations, for snapshots.
+///
+/// Reservations being made at the same time, through shared references on
+/// other threads, may or may not be included. Either way the copy is
+/// consistent, since reservations only move the count of unreserved slots.
+impl Clone for Entities {
+    fn clone(&self) -> Self {
+        Self {
+            meta: self.meta.clone(),
+            free: self.free.clone(),
+            unreserved: AtomicIsize::new(self.unreserved.load(Ordering::Relaxed)),
+            len: self.len,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.meta.clone_from(&source.meta);
+        self.free.clone_from(&source.free);
+        *self.unreserved.get_mut() = source.unreserved.load(Ordering::Relaxed);
+        self.len = source.len;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +509,29 @@ mod tests {
             (reserved, flush(&mut entities))
         };
         assert_eq!(history(), history());
+    }
+
+    #[test]
+    fn copies_hand_out_the_same_entities() {
+        let mut entities = Entities::default();
+        let all: Vec<_> = (0..4).map(|_| entities.alloc(HERE)).collect();
+        entities.free(all[1]);
+        let pending = entities.reserve();
+
+        let mut copy = entities.clone();
+        assert_eq!(copy.pending(), 1);
+        assert_eq!(flush(&mut copy), [pending]);
+        assert_eq!(flush(&mut entities), [pending]);
+        assert_eq!(copy.alloc(HERE), entities.alloc(HERE));
+
+        // Copying over an allocator replaces everything it knew.
+        let mut other = Entities::default();
+        other.alloc(HERE);
+        other.reserve();
+        other.clone_from(&entities);
+        assert_eq!(other.pending(), 0);
+        assert_eq!(other.len(), entities.len());
+        assert_eq!(other.reserve(), entities.reserve());
     }
 
     #[test]

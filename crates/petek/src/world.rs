@@ -13,6 +13,7 @@ use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
 use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
 use crate::resource::{Resource, Resources};
+use crate::snapshot::Snapshot;
 
 /// Stores entities and their components.
 ///
@@ -505,6 +506,133 @@ impl World {
     #[must_use]
     pub fn resource_mut<R: Resource>(&mut self) -> Option<&mut R> {
         self.resources.get_mut()
+    }
+
+    /// Registers the component type `C` for [snapshots](Self::snapshot),
+    /// which copy components by cloning them.
+    pub fn register_clone<C: Component + Clone>(&mut self) {
+        self.components.register_clone::<C>();
+    }
+
+    /// Registers the resource type `R` for [snapshots](Self::snapshot),
+    /// which copy resources by cloning them.
+    pub fn register_resource_clone<R: Resource + Clone>(&mut self) {
+        self.resources.register_clone::<R>();
+    }
+
+    /// Takes a snapshot of the world, which [`restore`](Self::restore) can
+    /// bring it back to later.
+    ///
+    /// This is what rollback networking needs: simulate ahead with the
+    /// inputs you have, and when the real ones arrive late, restore the
+    /// snapshot from before they mattered and simulate again.
+    ///
+    /// ```
+    /// use petek::{Component, Resource, World};
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct Position(i32);
+    /// impl Component for Position {}
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct Frame(u32);
+    /// impl Resource for Frame {}
+    ///
+    /// let mut world = World::new();
+    /// world.register_clone::<Position>();
+    /// world.register_resource_clone::<Frame>();
+    /// let player = world.spawn(Position(0));
+    /// world.insert_resource(Frame(0));
+    ///
+    /// let saved = world.snapshot();
+    /// world.get_mut::<Position>(player).unwrap().0 += 5;
+    /// world.spawn(Position(10));
+    /// world.resource_mut::<Frame>().unwrap().0 += 1;
+    ///
+    /// world.restore(&saved);
+    /// assert_eq!(world.get::<Position>(player), Some(&Position(0)));
+    /// assert_eq!(world.len(), 1);
+    /// assert_eq!(world.resource::<Frame>(), Some(&Frame(0)));
+    /// ```
+    ///
+    /// The snapshot clones every component and resource in the world, so
+    /// their types must be registered first, with
+    /// [`register_clone`](Self::register_clone) and
+    /// [`register_resource_clone`](Self::register_resource_clone).
+    ///
+    /// # Panics
+    ///
+    /// If the world holds a component or resource whose type is not
+    /// registered. If cloning one panics, the panic is passed on.
+    #[must_use]
+    #[track_caller]
+    pub fn snapshot(&self) -> Snapshot {
+        if let Some(name) = self.archetypes.uncloneable(&self.components) {
+            panic!(
+                "cannot snapshot a world holding `{name}` components: \
+                 register them with `World::register_clone` first"
+            );
+        }
+        if let Some(name) = self.resources.uncloneable() {
+            panic!(
+                "cannot snapshot a world holding a `{name}` resource: \
+                 register it with `World::register_resource_clone` first"
+            );
+        }
+        Snapshot {
+            world: self.id,
+            entities: self.entities.clone(),
+            // SAFETY: queries that write hold the world exclusively, so with
+            // `&self` held, no one is writing any component.
+            archetypes: unsafe { self.archetypes.snapshot(&self.components) },
+            resources: self.resources.snapshot(),
+            change_tick: self.change_tick,
+        }
+    }
+
+    /// Brings the world back to the state it was in when `snapshot` was
+    /// taken.
+    ///
+    /// The world then cannot be told apart from what it was: it has the same
+    /// entities, components, resources and ticks, and stores them in the same
+    /// order, so the same operations have the same results again. Entity
+    /// handles spawned since the snapshot was taken mean nothing anymore, and
+    /// may come to refer to other entities.
+    ///
+    /// What is not part of the world is not rewound, such as the commands in
+    /// a [`CommandQueue`](crate::command::CommandQueue), or the last run of a
+    /// [`QueryState`](crate::query::QueryState).
+    ///
+    /// The snapshot is left as it is, so the world can be brought back to it
+    /// any number of times.
+    ///
+    /// # Panics
+    ///
+    /// If the snapshot was taken of another world. If cloning a component or
+    /// resource panics, the panic is passed on, and the world is left
+    /// unchanged.
+    #[track_caller]
+    pub fn restore(&mut self, snapshot: &Snapshot) {
+        assert!(
+            snapshot.world == self.id,
+            "a `Snapshot` was restored into a world other than the one it was taken of",
+        );
+        // Clone the snapshot's contents first, so that if a clone panics, the
+        // world is left unchanged.
+        let mut archetypes: Vec<_> = snapshot
+            .archetypes
+            .iter()
+            .map(|archetype| archetype.clone_with(&self.components))
+            .collect();
+        let mut resources = self.resources.clone_snapshot(&snapshot.resources);
+        // Swap them in. No user code runs until the world is consistent
+        // again.
+        let removed = self.archetypes.restore(&mut archetypes, &self.components);
+        self.resources.restore(&mut resources);
+        self.entities.clone_from(&snapshot.entities);
+        self.change_tick = snapshot.change_tick;
+        // Only now drop what the world held before, which runs destructors.
+        drop((removed, archetypes, resources));
     }
 
     /// The world's current tick, which moves forward every time something is

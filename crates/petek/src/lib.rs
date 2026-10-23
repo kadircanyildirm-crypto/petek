@@ -68,6 +68,7 @@ mod entity;
 mod hash;
 pub mod query;
 mod resource;
+mod snapshot;
 mod storage;
 mod world;
 
@@ -76,6 +77,7 @@ pub use change::{Mut, Tick};
 pub use component::{Component, ComponentInfo};
 pub use entity::Entity;
 pub use resource::Resource;
+pub use snapshot::Snapshot;
 pub use world::{NoSuchEntity, RemoveError, SpawnBatch, World};
 
 // Checks that the examples in the README compile and run.

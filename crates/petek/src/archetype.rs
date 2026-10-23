@@ -2,6 +2,7 @@
 //! components, and the cached transitions between them.
 
 use std::fmt;
+use std::mem;
 use std::ptr::NonNull;
 use std::slice;
 
@@ -47,15 +48,6 @@ pub struct Archetype {
     /// `None` if this archetype lacks some of the bundle's components.
     remove_edges: FastHashMap<BundleId, Option<TransitionId>>,
 }
-
-// SAFETY: columns are only ever built from `ComponentInfo`s, which only
-// describe components, and components are `Send + Sync`. The change ticks are
-// in `UnsafeCell`s, which queries only write while they have exclusive access
-// to the component (see `TickSlice`). Everything else in an archetype is plain
-// data.
-unsafe impl Send for Archetype {}
-// SAFETY: as above.
-unsafe impl Sync for Archetype {}
 
 impl Archetype {
     fn new(component_ids: Box<[ComponentId]>, components: &Components) -> Self {
@@ -360,6 +352,80 @@ impl Archetype {
         let columns = &mut self.columns;
         drop_each(0..columns.len(), |index| columns[index].clear());
     }
+
+    /// The component of a non-empty column that is not registered for
+    /// snapshots, if there is one.
+    fn uncloneable(&self, components: &Components) -> Option<ComponentId> {
+        if self.entities.is_empty() {
+            return None;
+        }
+        self.component_ids
+            .iter()
+            .copied()
+            .find(|&id| components.clone_fn(id).is_none())
+    }
+}
+
+/// A copy of an archetype's entities and components, kept by a snapshot.
+pub(crate) struct ArchetypeSnapshot {
+    component_ids: Box<[ComponentId]>,
+    entities: Vec<Entity>,
+    columns: Box<[Column]>,
+}
+
+impl ArchetypeSnapshot {
+    /// Copies the given contents of an archetype, cloning the components with
+    /// the functions registered for them.
+    ///
+    /// If a clone panics, nothing is leaked.
+    ///
+    /// # Panics
+    ///
+    /// If a non-empty column's component is not registered for snapshots.
+    ///
+    /// # Safety
+    ///
+    /// Each column must store the component at the same index of
+    /// `component_ids`, and no one may be writing the columns while this
+    /// runs.
+    unsafe fn copy(
+        component_ids: &[ComponentId],
+        entities: &[Entity],
+        columns: &[Column],
+        components: &Components,
+    ) -> Self {
+        let columns = component_ids
+            .iter()
+            .zip(columns)
+            .map(|(&id, column)| {
+                // SAFETY: the caller guarantees the column stores component
+                // `id`, which the function registered for `id` clones, and
+                // that no one is writing it.
+                unsafe { column.clone_with(components.clone_fn(id)) }
+            })
+            .collect();
+        Self {
+            component_ids: component_ids.into(),
+            entities: entities.to_vec(),
+            columns,
+        }
+    }
+
+    /// Clones the snapshot, as a first step to restoring it.
+    ///
+    /// If a clone panics, nothing is leaked.
+    pub(crate) fn clone_with(&self, components: &Components) -> Self {
+        // SAFETY: the snapshot's columns store the components listed, as they
+        // were copied from an archetype, and nothing ever writes them.
+        unsafe {
+            Self::copy(
+                &self.component_ids,
+                &self.entities,
+                &self.columns,
+                components,
+            )
+        }
+    }
 }
 
 impl fmt::Debug for Archetype {
@@ -402,6 +468,10 @@ pub(crate) struct Archetypes {
     by_id: Vec<Archetype>,
     by_components: FastHashMap<Box<[ComponentId]>, ArchetypeId>,
     transitions: Vec<Transition>,
+    /// Changes whenever archetypes are removed, which only restoring a
+    /// snapshot does. Their ids may then be reused for other archetypes, so
+    /// whatever remembers archetype ids must forget them when it changes.
+    epoch: u64,
 }
 
 impl Archetypes {
@@ -412,11 +482,18 @@ impl Archetypes {
             by_id: vec![empty],
             by_components: [(Box::default(), ArchetypeId::EMPTY)].into_iter().collect(),
             transitions: Vec::new(),
+            epoch: 0,
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         self.by_id.len()
+    }
+
+    /// See the field of the same name.
+    #[inline]
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Iterates over all archetypes, in order of their ids.
@@ -578,6 +655,96 @@ impl Archetypes {
     pub(crate) fn clear_entities(&mut self) {
         let archetypes = &mut self.by_id;
         drop_each(0..archetypes.len(), |index| archetypes[index].clear());
+    }
+
+    /// The name of a component that some entity has, but that is not
+    /// registered for snapshots, if there is one.
+    pub(crate) fn uncloneable(&self, components: &Components) -> Option<&'static str> {
+        let id = self
+            .by_id
+            .iter()
+            .find_map(|archetype| archetype.uncloneable(components))?;
+        Some(components.info(id).name())
+    }
+
+    /// Copies every archetype, in order, cloning the components.
+    ///
+    /// If a clone panics, nothing is leaked.
+    ///
+    /// # Panics
+    ///
+    /// If some entity has a component that is not registered for snapshots.
+    ///
+    /// # Safety
+    ///
+    /// No one may be writing any component while this runs.
+    pub(crate) unsafe fn snapshot(&self, components: &Components) -> Box<[ArchetypeSnapshot]> {
+        self.by_id
+            .iter()
+            .map(|archetype| {
+                // SAFETY: an archetype's columns store its components in order,
+                // and the caller guarantees no one is writing them.
+                unsafe {
+                    ArchetypeSnapshot::copy(
+                        &archetype.component_ids,
+                        &archetype.entities,
+                        &archetype.columns,
+                        components,
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Makes the archetypes those of a snapshot of this world, with the
+    /// contents in `snapshot`, a clone of it.
+    ///
+    /// Archetypes are kept, and keep their cached transitions, as long as
+    /// they match the snapshot's. The rest are removed, and those the world
+    /// lacks are created. Each archetype's contents are then swapped with the
+    /// matching contents in `snapshot`.
+    ///
+    /// This runs no user code. The components the archetypes held are left in
+    /// `snapshot`, and the archetypes removed are returned, both to be dropped
+    /// by the caller once the world is consistent again.
+    #[must_use = "dropping what the archetypes held runs destructors, which the caller must do"]
+    pub(crate) fn restore(
+        &mut self,
+        snapshot: &mut [ArchetypeSnapshot],
+        components: &Components,
+    ) -> Vec<Archetype> {
+        let kept = self
+            .by_id
+            .iter()
+            .zip(&*snapshot)
+            .take_while(|(archetype, copy)| archetype.component_ids == copy.component_ids)
+            .count();
+        let mut removed = Vec::new();
+        if kept < self.by_id.len() {
+            removed = self.by_id.split_off(kept);
+            self.by_components.retain(|_, id| id.index() < kept);
+            // Transitions may lead to removed archetypes. They are only a
+            // cache, so forget them all.
+            self.transitions.clear();
+            for archetype in &mut self.by_id {
+                archetype.insert_edges.clear();
+                archetype.remove_edges.clear();
+            }
+            self.epoch += 1;
+        }
+        for copy in &snapshot[kept..] {
+            let id = ArchetypeId(u32::try_from(self.by_id.len()).expect("too many archetypes"));
+            self.by_id
+                .push(Archetype::new(copy.component_ids.clone(), components));
+            self.by_components.insert(copy.component_ids.clone(), id);
+        }
+        for (archetype, copy) in self.by_id.iter_mut().zip(snapshot) {
+            debug_assert_eq!(archetype.component_ids, copy.component_ids);
+            mem::swap(&mut archetype.entities, &mut copy.entities);
+            mem::swap(&mut archetype.columns, &mut copy.columns);
+            archetype.debug_assert_consistent();
+        }
+        removed
     }
 
     fn push_transition(&mut self, transition: Transition) -> TransitionId {

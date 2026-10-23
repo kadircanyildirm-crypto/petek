@@ -4,7 +4,7 @@
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 
-use super::blob_vec::BlobVec;
+use super::blob_vec::{BlobVec, CloneFn};
 use crate::change::{Tick, TickColumn, TickSlice};
 use crate::component::ComponentInfo;
 
@@ -19,6 +19,14 @@ pub(crate) struct Column {
     added: TickColumn,
     changed: TickColumn,
 }
+
+// SAFETY: columns are only ever built from `ComponentInfo`s, or copied from
+// other columns, and `ComponentInfo`s only describe components, which are
+// `Send + Sync`. The change ticks are in `UnsafeCell`s, which queries only
+// write while they have exclusive access to the component (see `TickSlice`).
+unsafe impl Send for Column {}
+// SAFETY: as above.
+unsafe impl Sync for Column {}
 
 impl Column {
     pub(crate) fn new(info: &ComponentInfo) -> Self {
@@ -181,6 +189,36 @@ impl Column {
         // SAFETY: the caller guarantees `row` is in bounds, and that `dst`
         // stores the same type and has room.
         unsafe { self.data.swap_remove_into_unchecked(row, &mut dst.data) };
+    }
+
+    /// Returns a copy of this column: its values, cloned by `clone`, and
+    /// their ticks.
+    ///
+    /// If a clone panics, nothing is leaked.
+    ///
+    /// # Panics
+    ///
+    /// If `clone` is `None` and the column is not empty.
+    ///
+    /// # Safety
+    ///
+    /// `clone` must clone this column's component, and no one may be writing
+    /// the column while this runs.
+    pub(crate) unsafe fn clone_with(&self, clone: Option<CloneFn>) -> Self {
+        let copy_ticks = |ticks: &TickColumn| {
+            ticks
+                .iter()
+                // SAFETY: the caller guarantees no one is writing the ticks.
+                .map(|tick| UnsafeCell::new(unsafe { *tick.get() }))
+                .collect()
+        };
+        Self {
+            // SAFETY: the caller guarantees that `clone` clones the values,
+            // and that no one is writing them.
+            data: unsafe { self.data.clone_with(clone) },
+            added: copy_ticks(&self.added),
+            changed: copy_ticks(&self.changed),
+        }
     }
 
     /// Drops all values, keeping the allocations. If a destructor panics, the
