@@ -202,6 +202,9 @@ order they were reserved.
 
 Since `Commands` only borrow the entity allocator, which queries never write,
 `Query::commands` hands them out alongside any query, even one that writes.
+Queries handed to systems refuse to, with a panic: systems may run in
+parallel, and the scheduler only keeps systems that say they reserve
+entities from doing so at the same time.
 A command queue remembers which world it reserved entities in, and panics if
 it is applied to another while it holds commands.
 

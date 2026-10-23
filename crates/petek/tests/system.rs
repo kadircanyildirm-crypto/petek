@@ -127,6 +127,17 @@ fn a_filter_reading_ticks_conflicts_with_a_write() {
 }
 
 #[test]
+#[should_panic(expected = "a query in a system cannot record commands")]
+fn queries_in_systems_cannot_record_commands() {
+    // It could reserve entities alongside a system with `Commands`, in an
+    // order that depends on timing.
+    let mut queue = petek::command::CommandQueue::new();
+    run_once(&mut World::new(), move |query: Query<Entity>| {
+        query.commands(&mut queue).spawn(Pos(0));
+    });
+}
+
+#[test]
 #[should_panic(expected = "needs a `system::Frame` resource, which the world does not hold")]
 fn missing_resources_are_reported() {
     run_once(&mut World::new(), |_: Res<Frame>| {});

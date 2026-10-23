@@ -178,10 +178,10 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         unsafe { Query::<D, F>::new(world, Some(self.data), self.filter, ticks) }.get(entity)
     }
 
-    /// Returns a query over `world` that visits the matching archetypes this
-    /// state lists, after checking those created since the last update. It
-    /// sees what changed since `ticks.last_run`, rather than since this
-    /// state's last run, which it does not count as a run.
+    /// Returns a query over `world` for a system, that visits the matching
+    /// archetypes this state lists, after checking those created since the
+    /// last update. It sees what changed since `ticks.last_run`, rather than
+    /// since this state's last run, which it does not count as a run.
     ///
     /// # Safety
     ///
@@ -197,7 +197,7 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // SAFETY: `update` checked that the states come from `world` and
         // brought `matched` up to date, `new` checked that `D` accesses no
         // component mutably more than once, and the caller holds the access.
-        unsafe { Query::new_cached(world, self.data, self.filter, &self.matched, ticks) }
+        unsafe { Query::new_in_system(world, self.data, self.filter, &self.matched, ticks) }
     }
 
     /// Calls `f` with every component the query accesses, and how, including

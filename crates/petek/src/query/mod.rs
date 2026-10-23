@@ -116,6 +116,10 @@ pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     /// every archetype is checked.
     matched: Option<&'w [ArchetypeId]>,
     ticks: Ticks,
+    /// Whether the query is a system's parameter. Systems may run in
+    /// parallel, so such a query must not reserve entities, which only
+    /// systems that say they do may.
+    in_system: bool,
 }
 
 impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
@@ -140,17 +144,18 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             filter,
             matched: None,
             ticks,
+            in_system: false,
         }
     }
 
-    /// Creates a query over `world` that only visits the archetypes in
-    /// `matched`.
+    /// Creates a query over `world` for a system, that only visits the
+    /// archetypes in `matched`.
     ///
     /// # Safety
     ///
     /// As for [`new`](Self::new), and `matched` must list each archetype of
     /// `world` that matches the states, and only those, at most once.
-    pub(crate) unsafe fn new_cached(
+    pub(crate) unsafe fn new_in_system(
         world: &'w World,
         data: D::State,
         filter: F::State,
@@ -163,6 +168,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             filter,
             matched: Some(matched),
             ticks,
+            in_system: true,
         }
     }
 
@@ -207,6 +213,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             filter: (self.filter, G::get_state(self.world.components())),
             matched: None,
             ticks: self.ticks,
+            in_system: self.in_system,
         }
     }
 
@@ -294,14 +301,24 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// assert_eq!(world.query::<&Explosion>().iter().count(), 1);
     /// ```
     ///
+    /// In a [system](crate::system), take a [`Commands`] parameter instead.
+    /// Systems may run in parallel, and only those that say they record
+    /// commands are kept from reserving entities at the same time, which
+    /// would hand them out in an order that depends on timing.
+    ///
     /// # Panics
     ///
-    /// If the queue holds commands recorded for another world.
+    /// If the query is a system's parameter, or the queue holds commands
+    /// recorded for another world.
     #[track_caller]
     pub fn commands<'q>(&self, queue: &'q mut CommandQueue) -> Commands<'q>
     where
         'w: 'q,
     {
+        assert!(
+            !self.in_system,
+            "a query in a system cannot record commands: take a `Commands` parameter instead",
+        );
         queue.commands(self.world)
     }
 
@@ -361,6 +378,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             filter: self.filter,
             matched: self.matched,
             ticks: self.ticks,
+            in_system: self.in_system,
         }
     }
 }
