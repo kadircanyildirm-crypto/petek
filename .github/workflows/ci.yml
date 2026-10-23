@@ -32,6 +32,9 @@ jobs:
       - run: cargo test --workspace --doc
       # Optimized, without debug assertions.
       - run: cargo test --workspace --release
+      # Rolls back hundreds of times, and checks that it ends up where a
+      # peer with every input on time does.
+      - run: cargo run --release --example rollback
 
   lint:
     name: Lint

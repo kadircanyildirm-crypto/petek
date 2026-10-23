@@ -125,6 +125,11 @@ assert_eq!(world.get::<Position>(player).unwrap().0, -1);
 let checksum: u64 = world.checksum();
 ```
 
+[`examples/rollback.rs`](crates/petek/examples/rollback.rs) plays a small
+game whose remote inputs arrive four frames late: it guesses them, rolls back
+whenever a guess was wrong, and ends with the same checksum as a peer that
+had every input on time. Run it with `cargo run --example rollback`.
+
 Keeping floating-point math deterministic across platforms remains up to the
 game.
 
