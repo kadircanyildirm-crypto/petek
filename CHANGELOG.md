@@ -38,4 +38,11 @@ and this project adheres to
   is now `Clone`, so that it can be saved along with a snapshot.
 - Checksums, for detecting desyncs: `World::checksum` hashes the entities and
   the component and resource types registered with `World::register_hash`
-  and `World::register_resource_hash`.
+  and `World::register_resource_hash`, leaving out ticks.
+- Change detection for resources, and `Mut::is_added` and `Mut::is_changed`.
+  `World::resource_mut` now returns a `Mut<R>`.
+- Systems: functions that take `Query`, `Res`, `ResMut`, `Commands` or
+  `&World` parameters, or `&mut World`. Systems compare changes with their
+  own last run, which snapshots rewind.
+- `Schedule`, which runs systems in parallel with the same result as running
+  them one after another, in the order they were added.

@@ -36,6 +36,46 @@ assert!(world.query::<&Velocity>().into_iter().next().is_none());
 assert_eq!(world.get::<Position>(wall).unwrap().x, 5.0);
 ```
 
+Systems are functions whose parameters say what they read and write, and a
+schedule runs them in parallel where those allow:
+
+```rust
+use petek::query::Query;
+use petek::schedule::Schedule;
+use petek::system::Res;
+use petek::{Component, Resource, World};
+
+struct Height(f32);
+impl Component for Height {}
+
+struct Speed(f32);
+impl Component for Speed {}
+
+struct Gravity(f32);
+impl Resource for Gravity {}
+
+fn fall(gravity: Res<Gravity>, query: Query<&mut Speed>) {
+    for mut speed in query {
+        speed.0 -= gravity.0;
+    }
+}
+
+fn movement(query: Query<(&mut Height, &Speed)>) {
+    for (mut height, speed) in query {
+        height.0 += speed.0;
+    }
+}
+
+let mut world = World::new();
+world.insert_resource(Gravity(1.0));
+let ball = world.spawn((Height(10.0), Speed(0.0)));
+
+let mut schedule = Schedule::new();
+schedule.add_system(fall).add_system(movement);
+schedule.run(&mut world);
+assert_eq!(world.get::<Height>(ball).unwrap().0, 9.0);
+```
+
 ## Determinism
 
 Games with lockstep or rollback networking need every machine to compute the
@@ -48,14 +88,16 @@ change ticks.
   entities, archetypes, components and resources are numbered in the order
   they first appear.
 - Commands apply in the order they were recorded, and the entities they spawn
-  are reserved in that order too. Reserving entities from several threads at
-  once is safe, but who gets which entity then depends on timing; the planned
-  scheduler will never run two systems that spawn entities at the same time.
+  are reserved in that order too.
+- A schedule's result is the same on any number of threads as running its
+  systems one after another, in the order they were added: systems that
+  conflict keep that order, each runs at a tick assigned in that order, and
+  two systems that spawn entities never run at the same time.
 - Change detection counts writes with a 64-bit tick that only moves when the
   world is written to, so it cannot wrap around or drift between machines.
 - Restoring a snapshot brings back everything, down to the order archetypes
-  were created in, so simulating again after a rollback gives exactly the
-  world that never mispredicted.
+  were created in and the last run of every system, so simulating again after
+  a rollback gives exactly the world that never mispredicted.
 
 ```rust
 use petek::{Component, World};
@@ -82,9 +124,8 @@ assert_eq!(world.get::<Position>(player).unwrap().0, -1);
 let checksum: u64 = world.checksum();
 ```
 
-A parallel scheduler whose results match running systems one after another
-is next on the [roadmap](#roadmap). Keeping floating-point math deterministic
-across platforms remains up to the game.
+Keeping floating-point math deterministic across platforms remains up to the
+game.
 
 ## Soundness
 
@@ -98,6 +139,8 @@ strict standard:
   entity half-moved;
 - the borrow checker keeps queries from overlapping with writes, and a query
   that would alias a mutable reference, such as `(&mut A, &A)`, is rejected;
+- the scheduler never runs systems that conflict at the same time, and the
+  traits it relies on to know what systems access are sealed;
 - CI runs the whole test suite under [Miri] with strict provenance, under both
   the Stacked Borrows and Tree Borrows aliasing models, and on 32-bit and
   big-endian targets.
@@ -114,7 +157,7 @@ strict standard:
 - [x] Queries with filters, and cached query state
 - [x] Resources, commands and change detection
 - [x] Snapshots, rollback and world checksums
-- [ ] Systems and a deterministic parallel scheduler
+- [x] Systems and a deterministic parallel scheduler
 - [ ] Events, a rollback demo, benchmarks and derive macros
 
 ## License

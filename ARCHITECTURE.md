@@ -21,6 +21,10 @@ It is meant to be read before the code.
 | `command.rs` | `CommandQueue` and `Commands`, which record changes to apply later. |
 | `snapshot.rs` | `Snapshot`, the copy of a world that `World::snapshot` takes and `World::restore` brings back. |
 | `checksum.rs` | The platform-independent hasher behind `World::checksum`. |
+| `system/param.rs` | `SystemParam`: what a system can ask for, with `Res` and `ResMut`. |
+| `system/access.rs` | `SystemAccess`: what a system reads and writes, and when two conflict. |
+| `system/mod.rs` | The `System` trait, and the function and exclusive systems behind `IntoSystem`. |
+| `schedule.rs` | `Schedule`, which plans and runs systems on several threads. |
 | `query/data.rs` | `QueryData`: what a query fetches, implemented for `&T`, `&mut T`, `Entity`, `Option` and tuples. |
 | `query/filter.rs` | `QueryFilter`: `With`, `Without`, `Added`, `Changed`, `Or` and tuples. |
 | `query/iter.rs` | `QueryIter`, which walks the matching archetypes row by row. |
@@ -148,17 +152,19 @@ archetype again.
 ## Change detection
 
 Every world has a 64-bit **tick** that moves forward each time it is written
-to: each spawn, insert, `get_mut` and mutable query run gets a new tick. A
-column records, for each value, the tick at which it was added and the tick at
-which it last changed, and the ticks move along with the value when its entity
-changes archetype.
+to: each spawn, insert, `get_mut`, mutable query run and system run gets a new
+tick. A column records, for each value, the tick at which it was added and the
+tick at which it last changed, and the ticks move along with the value when
+its entity changes archetype. Resources keep the same two ticks.
 
 Queries for `&mut T` yield a `Mut<T>`, which stamps the component with the
 query's tick only when it is written through. A `QueryState` remembers the
 tick of its last run, and the `Added<T>` and `Changed<T>` filters let through
 the rows whose tick is newer. So a query sees what others wrote since it last
 ran, but not its own writes. A one-off query has no last run, so to it every
-component counts as added and changed.
+component counts as added and changed. In a system, queries and resources
+compare with the system's last run instead, which the world keeps (see
+[Systems](#systems)).
 
 Unlike the other filters, these decide row by row, so a query that uses them
 only knows an upper bound on its length. The `ArchetypeFilter` marker trait
@@ -192,6 +198,67 @@ Since `Commands` only borrow the entity allocator, which queries never write,
 `Query::commands` hands them out alongside any query, even one that writes.
 A command queue remembers which world it reserved entities in, and panics if
 it is applied to another while it holds commands.
+
+## Systems
+
+A system is a function whose parameters implement `SystemParam`: queries,
+`Res` and `ResMut`, their `Option` forms, `Commands`, and `&World`. Each
+parameter keeps a state between runs, such as a `QueryState` or a command
+queue, and reports what it accesses as a `SystemAccess`: components and
+resources it reads or writes, whether it reserves entities, and whether it
+reads the whole world. Query filters count as reading the components whose
+ticks they compare.
+
+When a system first runs, its parameters' accesses are checked against each
+other, and a system with two that conflict panics: using both at once could
+alias a mutable reference. Two parameters conflict when one writes what the
+other accesses, much like two queries; parameters of one system may both
+reserve entities, since one thread uses them in a fixed order.
+
+Turning a function into a system takes a trick, the same as in Bevy: a
+function `fn(Query<&A>)` is generic over the lifetimes it borrows, so
+`SystemParamFunction` requires both `FnMut(P)`, which fixes the parameter
+types `P`, and `FnMut` of their items for any lifetime of the world. A
+function that takes `&mut World` instead is an *exclusive* system.
+
+`System` and `SystemParam` are sealed. The scheduler trusts what systems
+report they access: a system that left something out could race with the
+systems running alongside it.
+
+### Scheduling
+
+A `Schedule` splits its systems into phases at each exclusive system. In a
+phase, systems run on a shared world, and each waits for every earlier
+system of the phase that it conflicts with. That gives the same result as
+running the systems one after another, in the order they were added, since
+systems that do not conflict touch nothing in common:
+
+- **Ticks** are assigned up front, one per system in that order, and the
+  world's tick moves past them before the phase starts. A system's ticks do
+  not depend on which finishes first, and a panicking system leaves the
+  world's tick ahead of every tick in the world.
+- **Entities** reserved by systems running at the same time would be handed
+  out in an order that depends on timing. So reserving entities counts as a
+  conflict, and systems with `Commands`, or with `&World`, which can make a
+  command queue, never run at the same time.
+- **Commands** are recorded into each system's own queue, and applied in the
+  order the systems were added, before each exclusive system and at the end.
+
+A phase runs on scoped threads that take systems from a shared queue as they
+become ready, under one mutex, and wait on a condition variable otherwise.
+Each system sits behind a mutex of its own, so the threads can share the list
+while each system is only ever run by one of them. A panicking system is
+caught, stops the others from starting, and is passed on once those running
+have finished.
+
+Writes through a shared world are sound because the scheduler only runs a
+system alongside systems it does not conflict with. Resources sit in
+`UnsafeCell`s, like ticks, so that a system with `ResMut` can write one
+through the shared world.
+
+The tick of each system's last run is kept in the world, not in the system,
+so that snapshots copy it and restoring one rewinds systems' change
+detection along with everything else.
 
 ## Snapshots and rollback
 
@@ -271,8 +338,8 @@ when peers run on different platforms.
 
 Given the same sequence of operations, a world ends up bit-for-bit the same:
 the same entity handles, the same rows in the same archetypes, and the same
-change ticks. That holds because nothing depends on hash-map iteration order,
-addresses or timing:
+change ticks, whether systems ran on one thread or many. That holds because
+nothing depends on hash-map iteration order, addresses or timing:
 
 - component types, bundles, archetypes and resources are numbered in the order
   they are first seen, and hash maps are only used for lookups, never iterated
@@ -281,12 +348,13 @@ addresses or timing:
   order they are made;
 - queries visit archetypes in the order they were created, and rows in table
   order, which only depends on the history of the world;
-- ticks only move when the world is written to.
+- ticks only move when the world is written to, and schedules assign them
+  to systems in the order the systems were added;
+- schedules never run two systems that reserve entities at the same time.
 
 Reserving entities from several threads at once is safe, but which thread
-gets which entity then depends on timing. The planned parallel scheduler will
-keep systems that spawn entities from running at the same time, so that
-worlds stay deterministic even when systems run in parallel.
+gets which entity then depends on timing, which is why schedules serialize
+the systems that do.
 
 ## Invariants
 
@@ -304,6 +372,11 @@ The `unsafe` code relies on these invariants:
    archetype epoch. While an archetype exists, its id does not change.
 6. While entity reservations are pending, the free list does not change: every
    structural change flushes them first.
+7. While safe code holds a shared reference to the world, components,
+   resources and their ticks are only written by queries and systems that
+   hold exclusive access to them: writing takes `&mut World`, a query made
+   from one, or a system parameter, and schedules never run a system that
+   writes alongside one that reads the same thing, or the whole world.
 
 Debug builds assert invariant 2 after every structural change.
 
@@ -319,6 +392,9 @@ Debug builds assert invariant 2 after every structural change.
   bundle that panics halfway, zero-sized and over-aligned types, and a
   randomized model-based test of spawn, despawn, insert, remove, clear,
   snapshots, restores and queries, both cached and not.
+- A schedule of order-sensitive systems runs on 1, 2, 3 and 8 threads, and
+  the worlds are compared after every frame; the test fails when the
+  scheduler ignores conflicts.
 - Examples that must not compile, such as a read-only query that writes,
   state the error they expect, and CI checks it on nightly.
 - CI runs the suite under [Miri] with strict provenance, under both the
@@ -329,4 +405,5 @@ Debug builds assert invariant 2 after every structural change.
 
 ## Not yet implemented
 
-Systems and a parallel scheduler. See the roadmap in the README.
+Events, and systems ordered other than by when they were added. See the
+roadmap in the README.

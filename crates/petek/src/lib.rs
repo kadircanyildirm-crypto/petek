@@ -41,7 +41,9 @@
 //! # Ok::<(), petek::RemoveError>(())
 //! ```
 //!
-//! [Queries](query) visit every entity that has a given set of components:
+//! [Queries](query) visit every entity that has a given set of components,
+//! and [systems](system) are functions of them, which a
+//! [schedule](schedule::Schedule) runs in parallel:
 //!
 //! ```
 //! # use petek::{Component, World};
@@ -49,16 +51,23 @@
 //! # impl Component for Position {}
 //! # struct Velocity { x: f32, y: f32 }
 //! # impl Component for Velocity {}
-//! # let mut world = World::new();
-//! for (mut position, velocity) in world.query_mut::<(&mut Position, &Velocity)>() {
-//!     position.x += velocity.x;
-//!     position.y += velocity.y;
+//! use petek::query::Query;
+//! use petek::schedule::Schedule;
+//!
+//! fn movement(query: Query<(&mut Position, &Velocity)>) {
+//!     for (mut position, velocity) in query {
+//!         position.x += velocity.x;
+//!         position.y += velocity.y;
+//!     }
 //! }
+//!
+//! # let mut world = World::new();
+//! let mut schedule = Schedule::new();
+//! schedule.add_system(movement);
+//! schedule.run(&mut world);
 //! ```
 //!
 //! `ARCHITECTURE.md` in the repository explains how the crate works inside.
-//!
-//! **Work in progress:** systems are not implemented yet.
 
 mod archetype;
 mod bundle;
