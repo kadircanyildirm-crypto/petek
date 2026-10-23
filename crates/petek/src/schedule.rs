@@ -11,6 +11,7 @@ use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use crate::change::Ticks;
+use crate::pool::Pool;
 use crate::system::{IntoSystem, System};
 use crate::world::{World, WorldId};
 
@@ -83,6 +84,9 @@ pub struct Schedule {
     /// How to run the systems, worked out after they are initialized.
     plan: Vec<Phase>,
     threads: NonZeroUsize,
+    /// The threads, other than the caller's, that run systems in parallel,
+    /// spawned when first needed and kept between runs.
+    pool: Option<Pool>,
     /// Whether the last run panicked, leaving behind what systems deferred
     /// during a frame that never finished.
     interrupted: bool,
@@ -122,6 +126,7 @@ impl Schedule {
             initialized: 0,
             plan: Vec::new(),
             threads: thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+            pool: None,
             interrupted: false,
         }
     }
@@ -137,11 +142,21 @@ impl Schedule {
     /// thread included. With one, systems run one after another on the
     /// calling thread.
     ///
+    /// The schedule spawns the other threads the first time it runs systems
+    /// in parallel, and keeps them until it is dropped.
+    ///
     /// # Panics
     ///
     /// If `threads` is zero.
     pub fn set_threads(&mut self, threads: usize) -> &mut Self {
         self.threads = NonZeroUsize::new(threads).expect("a schedule needs at least one thread");
+        if self
+            .pool
+            .as_ref()
+            .is_some_and(|pool| pool.len() + 1 != threads)
+        {
+            self.pool = None;
+        }
         self
     }
 
@@ -185,7 +200,10 @@ impl Schedule {
         for phase in &self.plan {
             match phase {
                 Phase::Shared(phase) => {
-                    run_shared(&mut self.systems, phase, world, self.threads.get());
+                    let threads = self.threads.get();
+                    let pool = (threads > 1 && phase.systems.len() > 1)
+                        .then(|| &*self.pool.get_or_insert_with(|| Pool::new(threads - 1)));
+                    run_shared(&mut self.systems, phase, world, pool);
                 }
                 &Phase::Exclusive(index) => {
                     apply_deferred(&mut self.systems[applied..index], world);
@@ -266,12 +284,13 @@ fn plan_shared(systems: &[Box<dyn System>], range: Range<usize>) -> SharedPhase 
     }
 }
 
-/// Runs the systems of a shared phase, on up to `threads` threads.
+/// Runs the systems of a shared phase, on the threads of `pool` as well as
+/// this one if there is one, or one after another on this thread otherwise.
 fn run_shared(
     systems: &mut [Box<dyn System>],
     phase: &SharedPhase,
     world: &mut World,
-    threads: usize,
+    pool: Option<&Pool>,
 ) {
     let systems = &mut systems[phase.systems.clone()];
     let len = systems.len();
@@ -290,10 +309,9 @@ fn run_shared(
         .collect();
 
     let world_ref: &World = world;
-    let outcome = if threads == 1 || len == 1 {
-        run_one_by_one(systems, phase, world_ref, &ticks)
-    } else {
-        run_parallel(systems, phase, world_ref, &ticks, threads)
+    let outcome = match pool {
+        Some(pool) => run_parallel(systems, phase, world_ref, &ticks, pool),
+        None => run_one_by_one(systems, phase, world_ref, &ticks),
     };
 
     // Whether or not a system panicked, the world's tick ends up past every
@@ -370,14 +388,14 @@ struct Progress {
     outcome: Outcome,
 }
 
-/// Runs the systems of a shared phase on up to `threads` threads, each
-/// system once all the systems it waits for have finished.
+/// Runs the systems of a shared phase on the threads of `pool` and this one,
+/// each system once all the systems it waits for have finished.
 fn run_parallel(
     systems: &mut [Box<dyn System>],
     phase: &SharedPhase,
     world: &World,
     ticks: &[Ticks],
-    threads: usize,
+    pool: &Pool,
 ) -> Outcome {
     let len = systems.len();
     // One lock per system lets the threads share the list, while each system
@@ -450,13 +468,10 @@ fn run_parallel(
         }
     };
 
-    // `work` only captures references, so each thread gets a copy of it.
-    thread::scope(|scope| {
-        for _ in 1..threads.min(len) {
-            scope.spawn(work);
-        }
-        work();
-    });
+    // Every thread, this one included, takes systems as they become ready,
+    // until all have finished. `work` catches the panics of systems, so this
+    // only returns once it is done. More threads than systems could not help.
+    pool.run(len - 1, &work);
 
     progress
         .into_inner()

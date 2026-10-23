@@ -77,6 +77,7 @@ pub mod command;
 mod component;
 mod entity;
 mod hash;
+mod pool;
 pub mod query;
 mod resource;
 pub mod schedule;
