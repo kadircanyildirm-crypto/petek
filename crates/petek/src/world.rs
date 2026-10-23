@@ -391,10 +391,10 @@ impl World {
         let column = self.archetypes.get_mut(archetype).column_mut(column);
         // SAFETY: as in `get`, and `&mut self` makes the access exclusive for
         // the returned lifetime.
-        let (value, changed) = unsafe { column.get_unchecked_mut(row) };
+        let (value, added, changed) = unsafe { column.get_unchecked_mut(row) };
         // SAFETY: as above.
         let value = unsafe { value.cast::<T>().as_mut() };
-        Some(Mut::new(value, changed, tick))
+        Some(Mut::new(value, added, changed, one_off_ticks(tick)))
     }
 
     /// Returns a query that reads the components in `D` of every entity that

@@ -102,7 +102,9 @@ impl<'w> TickSlice<'w> {
 /// [`World::get_mut`](crate::World::get_mut). It dereferences to `T`, so it
 /// can mostly be used like `&mut T`; only writing through it, with
 /// [`DerefMut`], marks the component as changed for the
-/// [`Changed`](crate::query::Changed) filter.
+/// [`Changed`](crate::query::Changed) filter. It can also tell whether the
+/// component was [added](Self::is_added) or [changed](Self::is_changed)
+/// since the query last ran.
 ///
 /// ```
 /// use petek::{Component, World};
@@ -129,23 +131,45 @@ impl<'w> TickSlice<'w> {
 /// ```
 pub struct Mut<'w, T: ?Sized> {
     value: &'w mut T,
+    /// When the value was added, which `Mut` never changes.
+    added: Tick,
     changed: &'w mut Tick,
-    this_run: Tick,
+    ticks: Ticks,
 }
 
 impl<'w, T: ?Sized> Mut<'w, T> {
-    pub(crate) fn new(value: &'w mut T, changed: &'w mut Tick, this_run: Tick) -> Self {
+    pub(crate) fn new(value: &'w mut T, added: Tick, changed: &'w mut Tick, ticks: Ticks) -> Self {
         Self {
             value,
+            added,
             changed,
-            this_run,
+            ticks,
         }
+    }
+
+    /// Returns `true` if the component was added since the query that handed
+    /// it out last ran.
+    ///
+    /// A one-off query, or [`World::get_mut`](crate::World::get_mut), has
+    /// never run before, so to it every component counts as added.
+    #[must_use]
+    #[inline]
+    pub fn is_added(&self) -> bool {
+        self.added > self.ticks.last_run
+    }
+
+    /// Returns `true` if the component was added or changed since the query
+    /// that handed it out last ran, including through this `Mut`.
+    #[must_use]
+    #[inline]
+    pub fn is_changed(&self) -> bool {
+        *self.changed > self.ticks.last_run
     }
 
     /// Returns the underlying reference, marking the component as changed.
     #[must_use]
     pub fn into_inner(self) -> &'w mut T {
-        *self.changed = self.this_run;
+        *self.changed = self.ticks.this_run;
         self.value
     }
 }
@@ -162,7 +186,7 @@ impl<T: ?Sized> Deref for Mut<'_, T> {
 impl<T: ?Sized> DerefMut for Mut<'_, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        *self.changed = self.this_run;
+        *self.changed = self.ticks.this_run;
         self.value
     }
 }

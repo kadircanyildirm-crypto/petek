@@ -118,19 +118,23 @@ impl Column {
         unsafe { self.data.get_unchecked(row) }
     }
 
-    /// Returns a pointer to the value at `row` for writing, and its change
-    /// tick.
+    /// Returns a pointer to the value at `row` for writing, the tick at which
+    /// it was added, and its change tick.
     ///
     /// # Safety
     ///
     /// `row` must be less than `len()`.
     #[inline]
-    pub(crate) unsafe fn get_unchecked_mut(&mut self, row: usize) -> (NonNull<u8>, &mut Tick) {
+    pub(crate) unsafe fn get_unchecked_mut(
+        &mut self,
+        row: usize,
+    ) -> (NonNull<u8>, Tick, &mut Tick) {
         debug_assert!(row < self.changed.len());
         // SAFETY: the caller guarantees `row` is in bounds of every vector.
         unsafe {
+            let added = *self.added.get_unchecked_mut(row).get_mut();
             let changed = self.changed.get_unchecked_mut(row).get_mut();
-            (self.data.get_unchecked_mut(row), changed)
+            (self.data.get_unchecked_mut(row), added, changed)
         }
     }
 

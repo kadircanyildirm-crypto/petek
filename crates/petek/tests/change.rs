@@ -87,6 +87,29 @@ fn a_query_does_not_see_its_own_writes() {
 }
 
 #[test]
+fn mut_knows_what_happened_since_the_last_run() {
+    let mut world = World::new();
+    let old = world.spawn(Pos(0));
+    let changed = world.spawn(Pos(1));
+    let mut state = QueryState::<(Entity, &mut Pos)>::new(&mut world);
+    let _ = state.iter_mut(&mut world).count();
+
+    let new = world.spawn(Pos(2));
+    world.get_mut::<Pos>(changed).unwrap().0 = 3;
+    for (entity, mut pos) in state.iter_mut(&mut world) {
+        assert_eq!(pos.is_added(), entity == new, "{entity}");
+        assert_eq!(pos.is_changed(), entity != old, "{entity}");
+        // Writing through it counts.
+        pos.0 += 1;
+        assert!(pos.is_changed());
+    }
+
+    // To `World::get_mut`, as to any one-off query, everything is new.
+    let pos = world.get_mut::<Pos>(old).unwrap();
+    assert!(pos.is_added() && pos.is_changed());
+}
+
+#[test]
 fn ticks_follow_components_between_archetypes() {
     let mut world = World::new();
     let a = world.spawn(Pos(0));

@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 
 use super::sealed;
 use crate::archetype::Archetype;
-use crate::change::{Mut, Tick, TickSlice, Ticks};
+use crate::change::{Mut, TickSlice, Ticks};
 use crate::component::{Component, ComponentId, ComponentInfo, Components};
 use crate::entity::Entity;
 
@@ -208,8 +208,8 @@ impl<T: Component> sealed::Data for &mut T {}
 impl<T: Component> QueryData for &mut T {
     type Item<'w> = Mut<'w, T>;
     type State = ComponentId;
-    /// The column, its change ticks, and the tick to stamp writes with.
-    type Fetch<'w> = (ColumnStart<T>, TickSlice<'w>, Tick);
+    /// The column, its added and change ticks, and the query's ticks.
+    type Fetch<'w> = (ColumnStart<T>, TickSlice<'w>, TickSlice<'w>, Ticks);
 
     fn init_state(components: &mut Components) -> ComponentId {
         components.register(ComponentInfo::of::<T>())
@@ -237,20 +237,27 @@ impl<T: Component> QueryData for &mut T {
         let column = archetype
             .column_index(id)
             .expect("the archetype has the component");
-        (
-            start,
-            archetype.column(column).changed_ticks(),
-            ticks.this_run,
-        )
+        let column = archetype.column(column);
+        (start, column.added_ticks(), column.changed_ticks(), ticks)
     }
 
     #[inline]
-    unsafe fn item<'w>((start, changed, this_run): &Self::Fetch<'w>, row: usize) -> Self::Item<'w> {
+    unsafe fn item<'w>(
+        (start, added, changed, ticks): &Self::Fetch<'w>,
+        row: usize,
+    ) -> Self::Item<'w> {
         // SAFETY: the caller guarantees `row` is in bounds of the column, so
-        // it holds a valid `T` and a tick, and that nothing else accesses
-        // either for `'w`.
-        let (value, changed) = unsafe { (start.row(row).as_mut(), changed.get_mut(row)) };
-        Mut::new(value, changed, *this_run)
+        // it holds a valid `T` and ticks, and that nothing else accesses the
+        // value or its change tick for `'w`. Only structural changes write
+        // added ticks, and they cannot happen for `'w`.
+        let (value, added, changed) = unsafe {
+            (
+                start.row(row).as_mut(),
+                added.read(row),
+                changed.get_mut(row),
+            )
+        };
+        Mut::new(value, added, changed, *ticks)
     }
 }
 
