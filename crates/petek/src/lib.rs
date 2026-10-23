@@ -70,8 +70,10 @@ mod entity;
 mod hash;
 pub mod query;
 mod resource;
+pub mod schedule;
 mod snapshot;
 mod storage;
+pub mod system;
 mod world;
 
 pub use bundle::Bundle;

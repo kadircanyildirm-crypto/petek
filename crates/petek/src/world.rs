@@ -42,6 +42,9 @@ pub struct World {
     resources: Resources,
     /// Moves forward every time something is written; see [`Tick`].
     change_tick: Tick,
+    /// The tick at which each system last ran, so that snapshots rewind
+    /// systems' change detection along with the world.
+    system_ticks: Vec<Tick>,
 }
 
 /// Uniquely identifies a world, so that state computed for one world, such as
@@ -81,6 +84,7 @@ impl World {
             archetypes: Archetypes::new(),
             resources: Resources::default(),
             change_tick: Tick::ZERO,
+            system_ticks: Vec::new(),
         }
     }
 
@@ -619,6 +623,7 @@ impl World {
             archetypes: unsafe { self.archetypes.snapshot(&self.components) },
             resources: self.resources.snapshot(),
             change_tick: self.change_tick,
+            system_ticks: self.system_ticks.as_slice().into(),
         }
     }
 
@@ -663,6 +668,14 @@ impl World {
         self.resources.restore(&mut resources);
         self.entities.clone_from(&snapshot.entities);
         self.change_tick = snapshot.change_tick;
+        // Systems added since the snapshot was taken had not run back then.
+        for (slot, tick) in self.system_ticks.iter_mut().enumerate() {
+            *tick = snapshot
+                .system_ticks
+                .get(slot)
+                .copied()
+                .unwrap_or(Tick::ZERO);
+        }
         // Only now drop what the world held before, which runs destructors.
         drop((removed, archetypes, resources));
     }
@@ -759,6 +772,33 @@ impl World {
         self.change_tick
     }
 
+    /// Moves the world's tick forward by `n`, as `n` calls to
+    /// [`increment_change_tick`](Self::increment_change_tick) would, and
+    /// returns the tick before.
+    pub(crate) fn advance_change_tick(&mut self, n: usize) -> Tick {
+        let before = self.change_tick;
+        self.change_tick = before.after(n);
+        before
+    }
+
+    /// Makes room for the ticks of a new system, which has never run, and
+    /// returns where they are kept.
+    pub(crate) fn add_system_ticks(&mut self) -> usize {
+        self.system_ticks.push(Tick::ZERO);
+        self.system_ticks.len() - 1
+    }
+
+    /// The tick at which the system whose ticks are kept in `slot` last ran.
+    #[inline]
+    pub(crate) fn system_last_run(&self, slot: usize) -> Tick {
+        self.system_ticks[slot]
+    }
+
+    #[inline]
+    pub(crate) fn set_system_last_run(&mut self, slot: usize, tick: Tick) {
+        self.system_ticks[slot] = tick;
+    }
+
     /// Makes reserved entities alive, without components, in the order they
     /// were reserved.
     pub(crate) fn flush(&mut self) {
@@ -808,6 +848,16 @@ impl World {
     #[inline]
     pub(crate) fn archetypes(&self) -> &Archetypes {
         &self.archetypes
+    }
+
+    #[inline]
+    pub(crate) fn resources(&self) -> &Resources {
+        &self.resources
+    }
+
+    #[inline]
+    pub(crate) fn resources_mut(&mut self) -> &mut Resources {
+        &mut self.resources
     }
 
     /// Returns the transition that spawns entities with a `B`.

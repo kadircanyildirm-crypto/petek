@@ -60,6 +60,7 @@ use std::any::type_name;
 use std::error::Error;
 use std::fmt;
 
+use crate::archetype::ArchetypeId;
 use crate::change::Ticks;
 use crate::command::{CommandQueue, Commands};
 use crate::component::{Component, Components};
@@ -76,7 +77,7 @@ pub use filter::{Added, ArchetypeFilter, Changed, Or, QueryFilter, With, Without
 pub use iter::QueryIter;
 pub use state::QueryState;
 
-use data::Access;
+pub(crate) use data::Access;
 use iter::Matched;
 
 /// Keeps the query traits from being implemented outside of this crate, since
@@ -111,6 +112,9 @@ pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     /// can match.
     data: Option<D::State>,
     filter: F::State,
+    /// The matching archetypes, if a [`QueryState`] listed them; otherwise
+    /// every archetype is checked.
+    matched: Option<&'w [ArchetypeId]>,
     ticks: Ticks,
 }
 
@@ -134,6 +138,30 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             world,
             data,
             filter,
+            matched: None,
+            ticks,
+        }
+    }
+
+    /// Creates a query over `world` that only visits the archetypes in
+    /// `matched`.
+    ///
+    /// # Safety
+    ///
+    /// As for [`new`](Self::new), and `matched` must list each archetype of
+    /// `world` that matches the states, and only those, at most once.
+    pub(crate) unsafe fn new_cached(
+        world: &'w World,
+        data: D::State,
+        filter: F::State,
+        matched: &'w [ArchetypeId],
+        ticks: Ticks,
+    ) -> Self {
+        Self {
+            world,
+            data: Some(data),
+            filter,
+            matched: Some(matched),
             ticks,
         }
     }
@@ -154,11 +182,13 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     #[must_use]
     pub fn filter<G: QueryFilter>(self) -> Query<'w, D, (F, G)> {
         // Filters only read ticks, which a query never writes before it has
-        // checked them, so this keeps `new`'s guarantees.
+        // checked them, so this keeps `new`'s guarantees. The archetypes that
+        // matched before may not match `G`, so they are all checked again.
         Query {
             world: self.world,
             data: self.data,
             filter: (self.filter, G::get_state(self.world.components())),
+            matched: None,
             ticks: self.ticks,
         }
     }
@@ -312,6 +342,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             world: self.world,
             data: self.data,
             filter: self.filter,
+            matched: self.matched,
             ticks: self.ticks,
         }
     }
@@ -331,15 +362,15 @@ impl<'w, D: QueryData, F: QueryFilter> IntoIterator for Query<'w, D, F> {
 
     fn into_iter(self) -> Self::IntoIter {
         let state = self.data.map(|data| (data, self.filter));
-        // SAFETY: the state comes from the world whose archetypes are scanned,
+        let archetypes = self.world.archetypes();
+        let matched = match self.matched {
+            Some(ids) => Matched::Cached(archetypes, ids.iter()),
+            None => Matched::Scan(archetypes.iter()),
+        };
+        // SAFETY: the state comes from the world whose archetypes are visited,
+        // `new_cached`'s caller guarantees the list of matching archetypes,
         // and `new`'s caller holds the access.
-        unsafe {
-            QueryIter::new(
-                state,
-                Matched::Scan(self.world.archetypes().iter()),
-                self.ticks,
-            )
-        }
+        unsafe { QueryIter::new(state, matched, self.ticks) }
     }
 }
 

@@ -29,7 +29,21 @@ impl Tick {
     /// If ticks run out, which takes 2⁶⁴ writes.
     #[must_use]
     pub(crate) fn next(self) -> Self {
-        Self(self.0.checked_add(1).expect("change ticks ran out"))
+        self.after(1)
+    }
+
+    /// The tick `n` ticks after this one.
+    ///
+    /// # Panics
+    ///
+    /// If ticks run out.
+    #[must_use]
+    pub(crate) fn after(self, n: usize) -> Self {
+        let next = u64::try_from(n)
+            .ok()
+            .and_then(|n| self.0.checked_add(n))
+            .expect("change ticks ran out");
+        Self(next)
     }
 }
 

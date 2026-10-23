@@ -3,12 +3,14 @@
 use std::any::type_name;
 use std::fmt;
 
+use super::data::Access;
 use super::iter::Matched;
 use super::{
     Query, QueryData, QueryError, QueryFilter, QueryIter, ReadOnlyQueryData, check_access,
 };
 use crate::archetype::ArchetypeId;
 use crate::change::{Tick, Ticks};
+use crate::component::ComponentId;
 use crate::entity::Entity;
 use crate::world::{World, WorldId};
 
@@ -174,6 +176,35 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
         // accesses no component mutably more than once, and `&mut World`
         // gives it exclusive access for `'w`.
         unsafe { Query::<D, F>::new(world, Some(self.data), self.filter, ticks) }.get(entity)
+    }
+
+    /// Returns a query over `world` that visits the matching archetypes this
+    /// state lists, after checking those created since the last update. It
+    /// sees what changed since `ticks.last_run`, rather than since this
+    /// state's last run, which it does not count as a run.
+    ///
+    /// # Safety
+    ///
+    /// `world` must be the world this state was created for, and for `'w`,
+    /// the caller must hold the access that
+    /// [`visit_access`](Self::visit_access) reports.
+    pub(crate) unsafe fn query_unchecked<'w>(
+        &'w mut self,
+        world: &'w World,
+        ticks: Ticks,
+    ) -> Query<'w, D, F> {
+        self.update(world);
+        // SAFETY: `update` checked that the states come from `world` and
+        // brought `matched` up to date, `new` checked that `D` accesses no
+        // component mutably more than once, and the caller holds the access.
+        unsafe { Query::new_cached(world, self.data, self.filter, &self.matched, ticks) }
+    }
+
+    /// Calls `f` with every component the query accesses, and how, including
+    /// those whose ticks its filter reads.
+    pub(crate) fn visit_access(&self, f: &mut impl FnMut(ComponentId, Access)) {
+        D::visit_access(&self.data, f);
+        F::visit_access(&self.filter, f);
     }
 
     /// Iterates over the matching entities, without checking anything.

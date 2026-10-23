@@ -21,6 +21,7 @@ pub struct Snapshot {
     pub(crate) archetypes: Box<[ArchetypeSnapshot]>,
     pub(crate) resources: Box<[Option<Stored>]>,
     pub(crate) change_tick: Tick,
+    pub(crate) system_ticks: Box<[Tick]>,
 }
 
 impl Snapshot {

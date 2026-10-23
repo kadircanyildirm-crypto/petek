@@ -65,6 +65,16 @@ impl Stored {
         let value = self.value.downcast_mut().expect("the slot holds an `R`");
         Mut::new(value, self.added, &mut self.changed, ticks)
     }
+
+    #[inline]
+    pub(crate) fn added(&self) -> Tick {
+        self.added
+    }
+
+    #[inline]
+    pub(crate) fn changed(&self) -> Tick {
+        self.changed
+    }
 }
 
 /// The resources of a world.
@@ -74,10 +84,11 @@ impl Stored {
 /// that snapshots can tell resources apart by slot.
 ///
 /// The resources are in `UnsafeCell`s, so that systems running in parallel
-/// will be able to each write a different one through a shared reference to
-/// the world. Through `&self`, a resource is only ever written by code that
-/// has been granted exclusive access to it, so the methods that take `&self`
-/// can read the resources.
+/// can each write a different one through a shared reference to the world.
+/// Through `&self`, a resource is only ever written by code that has been
+/// granted exclusive access to it (see
+/// [`get_unchecked_mut`](Self::get_unchecked_mut)), so the other methods that
+/// take `&self` can read the resources.
 #[derive(Default)]
 pub(crate) struct Resources {
     slots: FastHashMap<TypeId, usize>,
@@ -151,6 +162,22 @@ impl Resources {
         // SAFETY: through `&self`, only code with exclusive access to a
         // resource writes it, so no one is writing this one.
         unsafe { (*self.values[slot].get()).as_ref() }
+    }
+
+    /// Returns the resource in `slot`, if there is one, for writing.
+    ///
+    /// # Safety
+    ///
+    /// While the returned reference lives, no one else may access the
+    /// resource in `slot`.
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "the caller guarantees that the access is exclusive"
+    )]
+    pub(crate) unsafe fn get_unchecked_mut(&self, slot: usize) -> Option<&mut Stored> {
+        // SAFETY: the caller guarantees that no one else accesses the
+        // resource.
+        unsafe { (*self.values[slot].get()).as_mut() }
     }
 
     /// The number of resources present.
@@ -246,12 +273,17 @@ impl Resources {
         })
     }
 
+    /// The name of the resource type of `slot`, for diagnostics only.
+    pub(crate) fn name(&self, slot: usize) -> &'static str {
+        self.types[slot].name
+    }
+
     fn slot<R: Resource>(&self) -> Option<usize> {
         self.slots.get(&TypeId::of::<R>()).copied()
     }
 
     /// Returns the slot of `R`, creating it on first use.
-    fn slot_or_insert<R: Resource>(&mut self) -> usize {
+    pub(crate) fn slot_or_insert<R: Resource>(&mut self) -> usize {
         let (values, types) = (&mut self.values, &mut self.types);
         *self.slots.entry(TypeId::of::<R>()).or_insert_with(|| {
             values.push(UnsafeCell::new(None));
