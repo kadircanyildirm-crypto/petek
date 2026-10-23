@@ -4,6 +4,7 @@ use std::any::{TypeId, type_name};
 use std::fmt;
 use std::marker::PhantomData;
 
+use super::data::Access;
 use super::sealed;
 use crate::archetype::Archetype;
 use crate::change::{Tick, TickSlice, Ticks};
@@ -46,6 +47,14 @@ pub trait QueryFilter: sealed::Filter {
     /// Resolves the state without registering anything.
     #[doc(hidden)]
     fn get_state(components: &Components) -> Self::State;
+
+    /// Calls `f` with every component whose ticks the filter reads.
+    ///
+    /// Filters never read component values, and checking whether an
+    /// archetype has a component is no access at all, since archetypes only
+    /// change with exclusive access to the world.
+    #[doc(hidden)]
+    fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access));
 
     /// Returns `true` if the filter may let entities of the archetype
     /// through. Unless the filter is archetypal, it still checks each row.
@@ -186,6 +195,8 @@ impl<T: Component> QueryFilter for With<T> {
         get_id::<T>(components)
     }
 
+    fn visit_access(_: &Self::State, _: &mut impl FnMut(ComponentId, Access)) {}
+
     fn matches(state: &Self::State, archetype: &Archetype) -> bool {
         state.is_some_and(|id| archetype.contains(id))
     }
@@ -215,6 +226,8 @@ impl<T: Component> QueryFilter for Without<T> {
     fn get_state(components: &Components) -> Self::State {
         get_id::<T>(components)
     }
+
+    fn visit_access(_: &Self::State, _: &mut impl FnMut(ComponentId, Access)) {}
 
     fn matches(state: &Self::State, archetype: &Archetype) -> bool {
         state.is_none_or(|id| !archetype.contains(id))
@@ -247,6 +260,12 @@ macro_rules! impl_tick_filter {
 
             fn get_state(components: &Components) -> Self::State {
                 get_id::<T>(components)
+            }
+
+            fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access)) {
+                if let Some(id) = *state {
+                    f(id, Access::Read);
+                }
             }
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {
@@ -290,6 +309,8 @@ impl QueryFilter for () {
 
     fn get_state(_: &Components) {}
 
+    fn visit_access((): &(), _: &mut impl FnMut(ComponentId, Access)) {}
+
     fn matches((): &(), _: &Archetype) -> bool {
         true
     }
@@ -327,6 +348,12 @@ macro_rules! impl_query_filter_for_tuples {
 
             fn get_state(components: &Components) -> Self::State {
                 ($first::get_state(components), $($rest::get_state(components),)*)
+            }
+
+            fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access)) {
+                let ($first, $($rest,)*) = state;
+                $first::visit_access($first, f);
+                $($rest::visit_access($rest, f);)*
             }
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {
@@ -386,6 +413,12 @@ macro_rules! impl_query_filter_for_tuples {
 
             fn get_state(components: &Components) -> Self::State {
                 ($first::get_state(components), $($rest::get_state(components),)*)
+            }
+
+            fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access)) {
+                let ($first, $($rest,)*) = state;
+                $first::visit_access($first, f);
+                $($rest::visit_access($rest, f);)*
             }
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {
