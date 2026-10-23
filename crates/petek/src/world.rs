@@ -3,12 +3,14 @@
 use std::any::TypeId;
 use std::error::Error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::iter::FusedIterator;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archetype::{ArchetypeId, Archetypes, TransitionId};
 use crate::bundle::{Bundle, Bundles};
 use crate::change::{Mut, Tick, Ticks};
+use crate::checksum::ChecksumHasher;
 use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
 use crate::query::{Query, QueryData, ReadOnlyQueryData, check_access};
@@ -633,6 +635,72 @@ impl World {
         self.change_tick = snapshot.change_tick;
         // Only now drop what the world held before, which runs destructors.
         drop((removed, archetypes, resources));
+    }
+
+    /// Registers the component type `C` for [checksums](Self::checksum),
+    /// which hash components with `Hash`.
+    ///
+    /// Floating-point numbers do not implement `Hash`, but components that
+    /// hold them can implement it by hashing their
+    /// [`to_bits`](f32::to_bits).
+    pub fn register_hash<C: Component + Hash>(&mut self) {
+        self.components.register_hash::<C>();
+    }
+
+    /// Registers the resource type `R` for [checksums](Self::checksum), which
+    /// hash resources with `Hash`.
+    pub fn register_resource_hash<R: Resource + Hash>(&mut self) {
+        self.resources.register_hash::<R>();
+    }
+
+    /// Returns a checksum of the world, for detecting desyncs.
+    ///
+    /// Peers that simulate the same world in lockstep, or with rollback, can
+    /// exchange checksums now and then: if theirs differ, so do their worlds,
+    /// and the simulation has diverged.
+    ///
+    /// ```
+    /// use petek::{Component, World};
+    ///
+    /// #[derive(Hash)]
+    /// struct Health(u32);
+    /// impl Component for Health {}
+    ///
+    /// let [mut here, mut there] = [World::new(), World::new()];
+    /// for world in [&mut here, &mut there] {
+    ///     world.register_hash::<Health>();
+    ///     world.spawn(Health(10));
+    /// }
+    /// assert_eq!(here.checksum(), there.checksum());
+    ///
+    /// for mut health in there.query_mut::<&mut Health>() {
+    ///     health.0 -= 1;
+    /// }
+    /// assert_ne!(here.checksum(), there.checksum());
+    /// ```
+    ///
+    /// The checksum covers the entities, the order they are stored in, and
+    /// the world's tick. Of the components and resources, it only covers
+    /// those whose types are registered with
+    /// [`register_hash`](Self::register_hash) and
+    /// [`register_resource_hash`](Self::register_resource_hash). It leaves
+    /// out the ticks at which individual components changed.
+    ///
+    /// Worlds that cannot be told apart have the same checksum on any
+    /// platform with the same byte order, as long as the types are registered
+    /// in the same order, and their `Hash` implementations do not depend on
+    /// the platform themselves. The algorithm is not cryptographic, and may
+    /// change between versions of this crate.
+    #[must_use]
+    pub fn checksum(&self) -> u64 {
+        let mut hasher = ChecksumHasher::new();
+        self.change_tick.hash(&mut hasher);
+        self.entities.hash(&mut hasher);
+        // SAFETY: queries that write hold the world exclusively, so with
+        // `&self` held, no one is writing any component.
+        unsafe { self.archetypes.hash(&self.components, &mut hasher) };
+        self.resources.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// The world's current tick, which moves forward every time something is

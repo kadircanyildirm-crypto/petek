@@ -2,7 +2,9 @@
 
 use std::alloc::Layout;
 use std::any::{TypeId, type_name};
+use std::hash::Hash;
 
+use crate::checksum::{HashFn, hash_fn_of};
 use crate::hash::FastHashMap;
 use crate::storage::blob_vec::{CloneFn, DropFn, clone_fn_of, drop_fn_of};
 
@@ -95,6 +97,9 @@ pub struct Components {
     infos: Vec<ComponentInfo>,
     /// How to clone each component type, if it is registered for snapshots.
     clone_fns: Vec<Option<CloneFn>>,
+    /// The component types registered for checksums, in the order they were
+    /// registered, which is the order checksums visit them in.
+    hashed: Vec<(ComponentId, HashFn)>,
     ids: FastHashMap<TypeId, ComponentId>,
 }
 
@@ -103,6 +108,7 @@ impl Components {
         Self {
             infos: Vec::new(),
             clone_fns: Vec::new(),
+            hashed: Vec::new(),
             ids: FastHashMap::default(),
         }
     }
@@ -128,6 +134,20 @@ impl Components {
     #[inline]
     pub(crate) fn clone_fn(&self, id: ComponentId) -> Option<CloneFn> {
         self.clone_fns[id.0 as usize]
+    }
+
+    /// Registers `C` for checksums, which hash it with `Hash`.
+    pub(crate) fn register_hash<C: Component + Hash>(&mut self) {
+        let id = self.register(ComponentInfo::of::<C>());
+        if self.hashed.iter().all(|&(hashed, _)| hashed != id) {
+            self.hashed.push((id, hash_fn_of::<C>()));
+        }
+    }
+
+    /// The component types registered for checksums, with how to hash each,
+    /// in the order they were registered.
+    pub(crate) fn hashed(&self) -> &[(ComponentId, HashFn)] {
+        &self.hashed
     }
 
     /// Returns the id of a component type, if it has been registered.

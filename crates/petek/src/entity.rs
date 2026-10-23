@@ -1,10 +1,12 @@
 //! Entity handles and the allocator that hands them out.
 
 use std::fmt;
+use std::hash::Hasher;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use crate::archetype::ArchetypeId;
+use crate::checksum::ChecksumHasher;
 
 /// A lightweight handle to an entity.
 ///
@@ -321,6 +323,23 @@ impl Entities {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Hashes what decides the entities handed out from now on: the
+    /// generation of every slot, the free slots in order, and the pending
+    /// reservations. Which entities are alive is up to the archetypes.
+    pub(crate) fn hash(&self, hasher: &mut ChecksumHasher) {
+        // Integer slices would hash as bytes in memory, which depend on the
+        // platform's byte order, so every integer is written on its own.
+        hasher.write_usize(self.meta.len());
+        for meta in &self.meta {
+            hasher.write_u32(meta.generation.get());
+        }
+        hasher.write_usize(self.free.len());
+        for &index in &self.free {
+            hasher.write_u32(index);
+        }
+        hasher.write_isize(self.unreserved.load(Ordering::Relaxed));
     }
 }
 

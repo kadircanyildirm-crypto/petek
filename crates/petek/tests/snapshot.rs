@@ -8,11 +8,11 @@ use petek::command::CommandQueue;
 use petek::query::{Changed, QueryState};
 use petek::{Component, Entity, Resource, Snapshot, Tick, World};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Pos(i32);
 impl Component for Pos {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Vel(i32);
 impl Component for Vel {}
 
@@ -24,7 +24,7 @@ impl Component for Shield {}
 struct Tag(String);
 impl Component for Tag {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Frame(u32);
 impl Resource for Frame {}
 
@@ -85,6 +85,9 @@ fn new_world() -> World {
     world.register_clone::<Pos>();
     world.register_clone::<Vel>();
     world.register_resource_clone::<Frame>();
+    world.register_hash::<Pos>();
+    world.register_hash::<Vel>();
+    world.register_resource_hash::<Frame>();
     world
 }
 
@@ -95,7 +98,7 @@ fn restoring_brings_the_world_back() {
     let b = world.spawn(Pos(2));
     world.insert_resource(Frame(7));
     let saved = world.snapshot();
-    let before = dump(&world);
+    let before = (dump(&world), world.checksum());
     assert_eq!(saved.change_tick(), world.change_tick());
 
     world.get_mut::<Pos>(a).unwrap().0 = 100;
@@ -104,17 +107,17 @@ fn restoring_brings_the_world_back() {
     world.remove::<Vel>(a).unwrap();
     world.spawn_batch((0..10).map(Pos));
     world.remove_resource::<Frame>();
-    assert_ne!(dump(&world), before);
+    assert_ne!((dump(&world), world.checksum()), before);
 
     world.restore(&saved);
-    assert_eq!(dump(&world), before);
+    assert_eq!((dump(&world), world.checksum()), before);
     assert_eq!(world.get::<Pos>(b), Some(&Pos(2)));
 
     // The snapshot is still there, and can be restored again.
     world.spawn(Pos(3));
     world.resource_mut::<Frame>().unwrap().0 = 0;
     world.restore(&saved);
-    assert_eq!(dump(&world), before);
+    assert_eq!((dump(&world), world.checksum()), before);
 }
 
 #[test]
@@ -298,6 +301,7 @@ fn rolling_back_and_replaying_matches_never_having_mispredicted() {
     }
 
     assert_eq!(dump(&world), dump(&on_time));
+    assert_eq!(world.checksum(), on_time.checksum());
     // Spawning still hands out the same entities.
     assert_eq!(world.spawn(Pos(0)), on_time.spawn(Pos(0)));
 }

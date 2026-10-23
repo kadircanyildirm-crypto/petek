@@ -6,6 +6,7 @@ use std::ptr::NonNull;
 
 use super::blob_vec::{BlobVec, CloneFn};
 use crate::change::{Tick, TickColumn, TickSlice};
+use crate::checksum::{ChecksumHasher, HashFn};
 use crate::component::ComponentInfo;
 
 /// The values of one component in an archetype, with their change ticks.
@@ -219,6 +220,18 @@ impl Column {
             added: copy_ticks(&self.added),
             changed: copy_ticks(&self.changed),
         }
+    }
+
+    /// Hashes the values with `hash`, in order.
+    ///
+    /// # Safety
+    ///
+    /// `hash` must hash this column's component, and no one may be writing
+    /// the column while this runs.
+    pub(crate) unsafe fn hash_with(&self, hash: HashFn, hasher: &mut ChecksumHasher) {
+        // SAFETY: the first `len` values are valid, and the caller guarantees
+        // that `hash` hashes their type and that no one is writing them.
+        unsafe { hash(self.data.as_ptr(), self.len(), hasher) };
     }
 
     /// Drops all values, keeping the allocations. If a destructor panics, the

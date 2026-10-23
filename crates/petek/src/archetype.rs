@@ -2,12 +2,14 @@
 //! components, and the cached transitions between them.
 
 use std::fmt;
+use std::hash::Hasher;
 use std::mem;
 use std::ptr::NonNull;
 use std::slice;
 
 use crate::bundle::{Bundle, BundleId};
 use crate::change::Tick;
+use crate::checksum::ChecksumHasher;
 use crate::component::{ComponentId, Components};
 use crate::entity::Entity;
 use crate::hash::FastHashMap;
@@ -655,6 +657,36 @@ impl Archetypes {
     pub(crate) fn clear_entities(&mut self) {
         let archetypes = &mut self.by_id;
         drop_each(0..archetypes.len(), |index| archetypes[index].clear());
+    }
+
+    /// Hashes every archetype in order: its entities in order, and its
+    /// components of the types registered for checksums.
+    ///
+    /// Component ids depend on the order component types were first used in,
+    /// which can differ between worlds that hold the same, for example after
+    /// a rollback. So components are visited in the order their types were
+    /// registered for checksums instead, and not by column.
+    ///
+    /// # Safety
+    ///
+    /// No one may be writing any component while this runs.
+    pub(crate) unsafe fn hash(&self, components: &Components, hasher: &mut ChecksumHasher) {
+        hasher.write_usize(self.by_id.len());
+        for archetype in &self.by_id {
+            hasher.write_usize(archetype.component_ids.len());
+            hasher.write_usize(archetype.entities.len());
+            for entity in &archetype.entities {
+                hasher.write_u64(entity.to_bits());
+            }
+            for (index, &(id, hash)) in components.hashed().iter().enumerate() {
+                if let Some(column) = archetype.column_index(id) {
+                    hasher.write_usize(index);
+                    // SAFETY: the column stores component `id`, which `hash`
+                    // hashes, and the caller guarantees no one is writing it.
+                    unsafe { archetype.columns[column].hash_with(hash, hasher) };
+                }
+            }
+        }
     }
 
     /// The name of a component that some entity has, but that is not

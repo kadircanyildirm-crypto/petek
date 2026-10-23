@@ -8,15 +8,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use petek::query::{QueryState, Without};
 use petek::{Component, Entity, World};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Pos(i32);
 impl Component for Pos {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Vel(i32);
 impl Component for Vel {}
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Hash, PartialEq)]
 struct Name(String);
 impl Component for Name {}
 
@@ -338,19 +338,23 @@ fn matches_a_model_under_random_operations() {
     world.register_clone::<Pos>();
     world.register_clone::<Vel>();
     world.register_clone::<Name>();
+    world.register_hash::<Pos>();
+    world.register_hash::<Vel>();
+    world.register_hash::<Name>();
     let mut state = QueryState::new(&mut world);
     let mut model = Model::default();
     // Restoring the empty world removes every archetype, which the cached
     // query state must notice.
-    let empty = world.snapshot();
+    let empty = (world.snapshot(), world.checksum());
     let mut saved = None;
     let steps = if cfg!(miri) { 400 } else { 10_000 };
     for value in 0..steps {
         match random(500) {
-            0..5 => saved = Some((world.snapshot(), model.clone())),
+            0..5 => saved = Some((world.snapshot(), world.checksum(), model.clone())),
             5..10 => {
-                if let Some((snapshot, then)) = &saved {
+                if let Some((snapshot, checksum, then)) = &saved {
                     world.restore(snapshot);
+                    assert_eq!(world.checksum(), *checksum);
                     // Entities spawned since the snapshot may be handed out
                     // again, so only those dead back then must stay dead.
                     model.clone_from(then);
@@ -358,7 +362,8 @@ fn matches_a_model_under_random_operations() {
                 }
             }
             10 => {
-                world.restore(&empty);
+                world.restore(&empty.0);
+                assert_eq!(world.checksum(), empty.1);
                 model = Model::default();
                 check(&world, &mut state, &model);
             }

@@ -62,6 +62,7 @@
 mod archetype;
 mod bundle;
 mod change;
+mod checksum;
 pub mod command;
 mod component;
 mod entity;

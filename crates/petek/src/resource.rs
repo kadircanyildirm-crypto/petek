@@ -2,7 +2,9 @@
 //! entity.
 
 use std::any::{Any, TypeId, type_name};
+use std::hash::{Hash, Hasher};
 
+use crate::checksum::ChecksumHasher;
 use crate::hash::FastHashMap;
 
 /// A value of which a world holds at most one, outside of any entity, such as
@@ -38,6 +40,9 @@ pub(crate) type Value = Box<dyn Any + Send + Sync>;
 /// Clones a type-erased resource of the type the function was created for.
 type CloneFn = fn(&(dyn Any + Send + Sync)) -> Value;
 
+/// Hashes a type-erased resource of the type the function was created for.
+type HashFn = fn(&(dyn Any + Send + Sync), &mut ChecksumHasher);
+
 /// The resources of a world.
 ///
 /// Each resource type gets a slot the first time it is inserted or
@@ -51,6 +56,10 @@ pub(crate) struct Resources {
     values: Vec<Option<Value>>,
     /// The type of each slot.
     types: Vec<SlotType>,
+    /// The slots of the resource types registered for checksums, in the
+    /// order they were registered, which is the order checksums visit them
+    /// in.
+    hashed: Vec<(usize, HashFn)>,
 }
 
 /// The type of resource a slot holds.
@@ -95,6 +104,28 @@ impl Resources {
     pub(crate) fn register_clone<R: Resource + Clone>(&mut self) {
         let slot = self.slot_or_insert::<R>();
         self.types[slot].clone = Some(clone_resource::<R>);
+    }
+
+    /// Registers `R` for checksums, which hash it with `Hash`.
+    pub(crate) fn register_hash<R: Resource + Hash>(&mut self) {
+        let slot = self.slot_or_insert::<R>();
+        if self.hashed.iter().all(|&(hashed, _)| hashed != slot) {
+            self.hashed.push((slot, hash_resource::<R>));
+        }
+    }
+
+    /// Hashes the resources registered for checksums, and whether each is
+    /// present.
+    pub(crate) fn hash(&self, hasher: &mut ChecksumHasher) {
+        for &(slot, hash) in &self.hashed {
+            match self.values[slot].as_deref() {
+                Some(value) => {
+                    hasher.write_u8(1);
+                    hash(value, hasher);
+                }
+                None => hasher.write_u8(0),
+            }
+        }
     }
 
     /// The name of a resource present whose type is not registered for
@@ -181,4 +212,12 @@ fn clone_resource<R: Resource + Clone>(value: &(dyn Any + Send + Sync)) -> Value
             .expect("the slot holds an `R`")
             .clone(),
     )
+}
+
+/// The [`HashFn`] for `R`.
+fn hash_resource<R: Resource + Hash>(value: &(dyn Any + Send + Sync), hasher: &mut ChecksumHasher) {
+    value
+        .downcast_ref::<R>()
+        .expect("the slot holds an `R`")
+        .hash(hasher);
 }
