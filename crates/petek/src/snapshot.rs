@@ -5,7 +5,7 @@ use std::fmt;
 use crate::archetype::ArchetypeSnapshot;
 use crate::change::Tick;
 use crate::entity::Entities;
-use crate::resource::Value;
+use crate::resource::Stored;
 use crate::world::WorldId;
 
 /// A copy of a world, taken by [`World::snapshot`](crate::World::snapshot),
@@ -19,7 +19,7 @@ pub struct Snapshot {
     pub(crate) world: WorldId,
     pub(crate) entities: Entities,
     pub(crate) archetypes: Box<[ArchetypeSnapshot]>,
-    pub(crate) resources: Box<[Option<Value>]>,
+    pub(crate) resources: Box<[Option<Stored>]>,
     pub(crate) change_tick: Tick,
 }
 

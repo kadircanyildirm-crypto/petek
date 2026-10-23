@@ -28,7 +28,7 @@ fn resources_are_inserted_read_and_removed() {
     let mut world = World::new();
     assert!(!world.contains_resource::<Score>());
     assert_eq!(world.resource::<Score>(), None);
-    assert_eq!(world.resource_mut::<Score>(), None);
+    assert!(world.resource_mut::<Score>().is_none());
     assert_eq!(world.remove_resource::<Score>(), None);
 
     assert_eq!(world.insert_resource(Score(1)), None);
@@ -45,6 +45,22 @@ fn resources_are_inserted_read_and_removed() {
     // A removed resource can come back.
     world.insert_resource(Score(7));
     assert_eq!(world.resource::<Score>(), Some(&Score(7)));
+}
+
+#[test]
+fn writing_resources_moves_the_tick() {
+    let mut world = World::new();
+    let start = world.change_tick();
+    assert!(world.resource_mut::<Score>().is_none());
+    assert_eq!(world.change_tick(), start);
+
+    world.insert_resource(Score(0));
+    let inserted = world.change_tick();
+    assert!(inserted > start);
+    let score = world.resource_mut::<Score>().unwrap();
+    // A one-off access has never run before, so everything is new to it.
+    assert!(score.is_added() && score.is_changed());
+    assert!(world.change_tick() > inserted);
 }
 
 #[test]

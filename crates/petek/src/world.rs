@@ -482,8 +482,12 @@ impl World {
     /// assert_eq!(world.insert_resource(Score(1)), None);
     /// assert_eq!(world.insert_resource(Score(2)), Some(Score(1)));
     /// ```
+    ///
+    /// The resource counts as changed, and as added too unless it replaces
+    /// one, like a component that is inserted.
     pub fn insert_resource<R: Resource>(&mut self, resource: R) -> Option<R> {
-        self.resources.insert(resource)
+        let tick = self.increment_change_tick();
+        self.resources.insert(resource, tick)
     }
 
     /// Removes the resource of type `R` and returns it, if there is one.
@@ -505,9 +509,15 @@ impl World {
 
     /// Returns a mutable reference to the resource of type `R`, if there is
     /// one.
+    ///
+    /// Writing through it marks the resource as changed; see [`Mut`].
     #[must_use]
-    pub fn resource_mut<R: Resource>(&mut self) -> Option<&mut R> {
-        self.resources.get_mut()
+    pub fn resource_mut<R: Resource>(&mut self) -> Option<Mut<'_, R>> {
+        if !self.contains_resource::<R>() {
+            return None;
+        }
+        let tick = self.increment_change_tick();
+        self.resources.get_mut(one_off_ticks(tick))
     }
 
     /// Registers the component type `C` for [snapshots](Self::snapshot),

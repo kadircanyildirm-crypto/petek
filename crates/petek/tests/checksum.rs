@@ -59,16 +59,15 @@ fn registered_components_and_resources_are_covered() {
     assert_ne!(pos(5), pos(6));
     let vel = |value| checksum_after(move |world, first| world.insert(first, Vel(value)).unwrap());
     assert_ne!(vel(5), vel(6));
-    // Inserting a resource does not move the world's tick.
     let seed = |value| {
         checksum_after(move |world, _| {
             world.insert_resource(Seed(value));
         })
     };
     assert_ne!(seed(5), seed(6));
-    assert_eq!(seed(1), checksum_after(|_, _| {}));
     // A missing resource differs from any value, even zero.
     let removed = checksum_after(|world, _| {
+        world.insert_resource(Seed(0));
         world.remove_resource::<Seed>();
     });
     assert_ne!(removed, seed(0));
@@ -161,7 +160,7 @@ fn checksums_are_the_same_on_every_platform() {
     world.spawn((Pos(2), Vel(-2)));
     world.despawn(scout).unwrap();
     world.insert_resource(Seed(u64::MAX - 1));
-    assert_eq!(world.checksum(), 0xf129_2d28_2275_e024);
+    assert_eq!(world.checksum(), 0xcb6d_3ae3_d72c_4eed);
 }
 
 #[test]
