@@ -178,12 +178,29 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         self.filter()
     }
 
-    /// Only matches entities that also pass the filter `G`.
+    /// Only matches entities that also pass the filter `G`, which decides
+    /// for whole archetypes, such as [`With`] or [`Or`].
+    ///
+    /// Filters that compare ticks, [`Added`] and [`Changed`], belong in the
+    /// query's type instead, as in `Query<&Health, Changed<Health>>`. They
+    /// read the ticks of a component, and a schedule only knows what a
+    /// system reads from the types of its parameters, so it could run a
+    /// system that adds one here alongside another that writes those ticks:
+    ///
+    /// ```compile_fail,E0277
+    /// # use petek::{Component, World};
+    /// # use petek::query::Changed;
+    /// # struct Health(u32);
+    /// # impl Component for Health {}
+    /// let world = World::new();
+    /// let changed = world.query::<&Health>().filter::<Changed<Health>>();
+    /// ```
     #[must_use]
-    pub fn filter<G: QueryFilter>(self) -> Query<'w, D, (F, G)> {
-        // Filters only read ticks, which a query never writes before it has
-        // checked them, so this keeps `new`'s guarantees. The archetypes that
-        // matched before may not match `G`, so they are all checked again.
+    pub fn filter<G: ArchetypeFilter>(self) -> Query<'w, D, (F, G)> {
+        // Archetype filters read nothing: they only check which components an
+        // archetype has, which cannot change for `'w`. So this keeps `new`'s
+        // guarantees. The archetypes that matched before may not match `G`,
+        // so they are all checked again.
         Query {
             world: self.world,
             data: self.data,

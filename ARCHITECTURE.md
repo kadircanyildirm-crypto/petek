@@ -162,7 +162,8 @@ query's tick only when it is written through. A `QueryState` remembers the
 tick of its last run, and the `Added<T>` and `Changed<T>` filters let through
 the rows whose tick is newer. So a query sees what others wrote since it last
 ran, but not its own writes. A one-off query has no last run, so to it every
-component counts as added and changed. In a system, queries and resources
+component counts as added and changed; it cannot use these filters, which
+only make sense in a query's type. In a system, queries and resources
 compare with the system's last run instead, which the world keeps (see
 [Systems](#systems)).
 
@@ -177,6 +178,11 @@ the values themselves (see below): a query only writes the ticks of components
 it has exclusive access to. A filter reads a row's tick before the query
 yields that row, never after, so a query can both write `T` and filter on
 `Changed<T>`.
+
+These filters can only be part of a query's type, never added with
+`Query::filter`, which only takes filters that read nothing. A system's
+access is worked out from the types of its parameters, so a filter added at
+run time could read ticks that a system running alongside is writing.
 
 ## Commands and reserved entities
 

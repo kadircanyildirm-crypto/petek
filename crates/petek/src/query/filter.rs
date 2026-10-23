@@ -96,12 +96,16 @@ pub trait QueryFilter: sealed::Filter {
 ///
 /// ```compile_fail,E0599
 /// # use petek::{Component, World};
-/// # use petek::query::Changed;
+/// # use petek::query::{Changed, QueryState};
 /// # struct Position(f32);
 /// # impl Component for Position {}
-/// let world = World::new();
-/// let len = world.query::<&Position>().filter::<Changed<Position>>().iter().len();
+/// let mut world = World::new();
+/// let mut changed = QueryState::<&Position, Changed<Position>>::new(&mut world);
+/// let len = changed.iter(&world).len();
 /// ```
+///
+/// Only such filters can be added to a query after the fact, with
+/// [`Query::filter`](super::Query::filter).
 pub trait ArchetypeFilter: QueryFilter + sealed::Archetypal {}
 
 /// A [`QueryFilter`] that matches entities with a `T` component.
@@ -116,9 +120,9 @@ pub struct Without<T>(PhantomData<fn() -> T>);
 /// A [`QueryFilter`] that matches entities whose `T` component was added
 /// since the query last ran.
 ///
-/// Only a [`QueryState`](super::QueryState) remembers when it last ran: a
-/// one-off [`Query`](super::Query) has never run before, so to it every
-/// component counts as added.
+/// What remembers when the query last ran is its
+/// [`QueryState`](super::QueryState), or the [system](crate::system) it is a
+/// parameter of. One that has never run sees every component as added.
 pub struct Added<T>(PhantomData<fn() -> T>);
 
 /// A [`QueryFilter`] that matches entities whose `T` component was added or
@@ -126,7 +130,7 @@ pub struct Added<T>(PhantomData<fn() -> T>);
 ///
 /// A component changes when it is written through a [`Mut`](crate::Mut), or
 /// overwritten by [`World::insert`](crate::World::insert). As for [`Added`],
-/// to a one-off [`Query`](super::Query) every component counts as changed.
+/// to a query that has never run, every component counts as changed.
 pub struct Changed<T>(PhantomData<fn() -> T>);
 
 /// A [`QueryFilter`] that matches entities that pass at least one of the

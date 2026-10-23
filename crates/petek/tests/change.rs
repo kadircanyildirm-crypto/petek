@@ -195,24 +195,6 @@ fn single_entities_are_checked_against_change_filters() {
 }
 
 #[test]
-fn one_off_queries_see_everything_as_changed() {
-    let mut world = World::new();
-    world.spawn_batch((0..4).map(Pos));
-    assert_eq!(
-        world
-            .query::<&Pos>()
-            .filter::<Changed<Pos>>()
-            .iter()
-            .count(),
-        4
-    );
-    assert_eq!(
-        world.query::<&Pos>().filter::<Added<Pos>>().iter().count(),
-        4
-    );
-}
-
-#[test]
 fn ticks_are_deterministic() {
     fn run() -> (petek::Tick, Vec<Entity>) {
         let mut world = World::new();
