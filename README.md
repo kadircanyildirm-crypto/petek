@@ -53,11 +53,38 @@ change ticks.
   scheduler will never run two systems that spawn entities at the same time.
 - Change detection counts writes with a 64-bit tick that only moves when the
   world is written to, so it cannot wrap around or drift between machines.
+- Restoring a snapshot brings back everything, down to the order archetypes
+  were created in, so simulating again after a rollback gives exactly the
+  world that never mispredicted.
 
-Snapshots, rollback, world checksums for spotting desyncs, and a parallel
-scheduler whose results match running systems one after another are next on
-the [roadmap](#roadmap). Keeping floating-point math deterministic across
-platforms remains up to the game.
+```rust
+use petek::{Component, World};
+
+#[derive(Clone, Hash)]
+struct Position(i32);
+impl Component for Position {}
+
+let mut world = World::new();
+world.register_clone::<Position>(); // snapshots clone it
+world.register_hash::<Position>(); // checksums hash it
+let player = world.spawn(Position(0));
+
+// Keep a snapshot, and simulate ahead with a guessed input.
+let saved = world.snapshot();
+world.get_mut::<Position>(player).unwrap().0 += 1;
+
+// The real input arrives, and it differs: roll back and simulate again.
+world.restore(&saved);
+world.get_mut::<Position>(player).unwrap().0 -= 1;
+assert_eq!(world.get::<Position>(player).unwrap().0, -1);
+
+// Peers compare checksums to catch desyncs.
+let checksum: u64 = world.checksum();
+```
+
+A parallel scheduler whose results match running systems one after another
+is next on the [roadmap](#roadmap). Keeping floating-point math deterministic
+across platforms remains up to the game.
 
 ## Soundness
 
@@ -86,7 +113,7 @@ strict standard:
 - [x] Archetypes and `World`
 - [x] Queries with filters, and cached query state
 - [x] Resources, commands and change detection
-- [ ] Snapshots, rollback and world checksums
+- [x] Snapshots, rollback and world checksums
 - [ ] Systems and a deterministic parallel scheduler
 - [ ] Events, a rollback demo, benchmarks and derive macros
 

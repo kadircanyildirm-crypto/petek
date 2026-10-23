@@ -7,7 +7,8 @@
 //!
 //! Given the same sequence of operations, a world always ends up the same, down
 //! to its entity handles, iteration order and change ticks, as lockstep and
-//! rollback networking require.
+//! rollback networking require. [`World::snapshot`] and [`World::restore`]
+//! roll a world back, and [`World::checksum`] lets peers detect desyncs.
 //!
 //! ```
 //! use petek::{Component, World};

@@ -19,6 +19,8 @@ It is meant to be read before the code.
 | `change.rs` | `Tick`s, and `Mut`, which marks a component as changed when written through. |
 | `resource.rs` | The `Resource` trait and the per-world resource storage. |
 | `command.rs` | `CommandQueue` and `Commands`, which record changes to apply later. |
+| `snapshot.rs` | `Snapshot`, the copy of a world that `World::snapshot` takes and `World::restore` brings back. |
+| `checksum.rs` | The platform-independent hasher behind `World::checksum`. |
 | `query/data.rs` | `QueryData`: what a query fetches, implemented for `&T`, `&mut T`, `Entity`, `Option` and tuples. |
 | `query/filter.rs` | `QueryFilter`: `With`, `Without`, `Added`, `Changed`, `Or` and tuples. |
 | `query/iter.rs` | `QueryIter`, which walks the matching archetypes row by row. |
@@ -114,8 +116,10 @@ iterator adapters run exactly that loop, and computes `size_hint` and `count`
 from the archetype sizes alone.
 
 A `QueryState` keeps the state and the list of matching archetypes between
-runs. Archetypes are never removed, so on each run it only checks the
-archetypes created since the last one.
+runs, and on each run only checks the archetypes created since the last one.
+Archetypes are only ever removed by restoring a snapshot, which changes the
+world's *archetype epoch*; a `QueryState` that sees a new epoch checks every
+archetype again.
 
 ### Why handing out `&mut T` is sound
 
@@ -189,6 +193,61 @@ Since `Commands` only borrow the entity allocator, which queries never write,
 A command queue remembers which world it reserved entities in, and panics if
 it is applied to another while it holds commands.
 
+## Snapshots and rollback
+
+`World::snapshot` copies everything a world holds: the entity allocator, with
+its free list and pending reservations, every archetype's entities and
+columns, ticks included, the resources, and the world's tick. Components and
+resources are copied with `Clone`, through a function registered per type
+with `register_clone`, and a world holding a type that is not registered
+cannot be snapshotted. Type-erased cloning goes through the same kind of
+function pointer as dropping; if a clone panics, the clones made so far are
+dropped.
+
+`World::restore` makes the world indistinguishable from the one the snapshot
+was taken of, which is what lets a rollback be resimulated deterministically:
+
+- **Archetypes** are compared with the snapshot's, in order. Those that match
+  are kept; from the first that differs on, they are removed, and the
+  snapshot's are created in their place. Keeping archetypes created since the
+  snapshot would change the order queries visit archetypes in, and so the
+  results of a resimulation. Since a removed archetype's id may be reused by
+  another, removing any changes the archetype epoch, and the cached
+  transitions are forgotten.
+- **Component types and resource slots** are not rolled back. Their ids are
+  never observable, except through the order of an archetype's columns, which
+  nothing depends on: checksums visit components in their own order (see
+  below).
+- **Contents**: the snapshot's columns are swapped into archetypes with the
+  same component ids, which keeps invariant 3 below. Snapshots can be taken of
+  a world after a rollback, and restored in any order.
+
+Restoring follows the same rule as structural changes. Everything is cloned
+from the snapshot first, so that a panicking clone leaves the world unchanged;
+then it is swapped in, running no user code; and only then are the replaced
+components and resources dropped.
+
+What is not part of the world is not rewound: a `QueryState` still remembers
+running at a tick the world may not have reached again, so its change filters
+can miss changes, and a `CommandQueue` keeps its commands. `QueryState` is
+`Clone`, so that it can be saved along with a snapshot.
+
+## Checksums
+
+`World::checksum` hashes the world's tick, the entity allocator, every
+archetype's entities in order, and the components and resources whose types
+are registered with `register_hash`. Peers that compare checksums can tell
+that their worlds diverged.
+
+Two worlds that cannot be told apart can still have different component ids,
+for example when one of them used a component type for the first time in
+frames it then rolled back. So rather than visiting an archetype's columns in
+order, the checksum visits the registered types in the order they were
+registered, and marks each with its position in that order. Its hasher works
+on 64-bit words made from integer values rather than their bytes in memory,
+so that checksums do not depend on the platform; a test pins its output, and
+CI runs it on 32-bit and big-endian targets.
+
 ## Determinism
 
 Given the same sequence of operations, a world ends up bit-for-bit the same:
@@ -222,7 +281,8 @@ The `unsafe` code relies on these invariants:
 3. Column `i` of an archetype stores values of the type of the archetype's
    `i`-th component id; component ids are sorted and unique.
 4. Each set of components has at most one archetype.
-5. Archetypes are never removed, and their ids never change.
+5. Archetypes are only removed by restoring a snapshot, which changes the
+   archetype epoch. While an archetype exists, its id does not change.
 6. While entity reservations are pending, the free list does not change: every
    structural change flushes them first.
 
@@ -236,10 +296,10 @@ Debug builds assert invariant 2 after every structural change.
   and pointer provenance survive.
 - Debug assertions check bounds and other cheap preconditions of the
   `unsafe` functions.
-- The test suite includes panicking destructors, a hand-written bundle that
-  panics halfway, zero-sized and over-aligned types, and a randomized
-  model-based test of spawn, despawn, insert, remove, clear and queries, both
-  cached and not.
+- The test suite includes panicking destructors and clones, a hand-written
+  bundle that panics halfway, zero-sized and over-aligned types, and a
+  randomized model-based test of spawn, despawn, insert, remove, clear,
+  snapshots, restores and queries, both cached and not.
 - Examples that must not compile, such as a read-only query that writes,
   state the error they expect, and CI checks it on nightly.
 - CI runs the suite under [Miri] with strict provenance, under both the
@@ -250,5 +310,4 @@ Debug builds assert invariant 2 after every structural change.
 
 ## Not yet implemented
 
-Snapshots and rollback, world checksums, systems and a parallel scheduler. See
-the roadmap in the README.
+Systems and a parallel scheduler. See the roadmap in the README.

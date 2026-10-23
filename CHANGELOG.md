@@ -31,3 +31,11 @@ and this project adheres to
 - Change detection: `Added` and `Changed` query filters, and the `Mut` smart
   pointer that marks a component as changed when it is written through.
   Queries for `&mut T` and `World::get_mut` now yield `Mut<T>`.
+- Snapshots, for rollback: `World::snapshot` copies the world into a
+  `Snapshot`, and `World::restore` brings the world back to it exactly. The
+  component and resource types it holds must be registered with
+  `World::register_clone` and `World::register_resource_clone`. `QueryState`
+  is now `Clone`, so that it can be saved along with a snapshot.
+- Checksums, for detecting desyncs: `World::checksum` hashes the entities and
+  the component and resource types registered with `World::register_hash`
+  and `World::register_resource_hash`.
