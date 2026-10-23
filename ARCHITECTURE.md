@@ -240,12 +240,18 @@ A `Schedule` splits its systems into phases at each exclusive system. In a
 phase, systems run on a shared world, and each waits for every earlier
 system of the phase that it conflicts with. That gives the same result as
 running the systems one after another, in the order they were added, since
-systems that do not conflict touch nothing in common:
+systems that do not conflict touch nothing in common, unless components or
+resources share state through interior mutability, such as a `Mutex`, which
+the scheduler cannot see:
 
-- **Ticks** are assigned up front, one per system in that order, and the
-  world's tick moves past them before the phase starts. A system's ticks do
-  not depend on which finishes first, and a panicking system leaves the
-  world's tick ahead of every tick in the world.
+- **Ticks** are assigned up front, one per system in that order. A system's
+  ticks do not depend on which finishes first. Most systems cannot see the
+  world's tick, but one with `&World` can, and should see its own, as if the
+  systems ran one after another: the world's tick is an atomic, which the
+  schedule sets just before running such a system. Those never run alongside
+  each other, since they all count as reserving entities. Once the phase is
+  over, even if a system panicked, the world's tick moves past every system
+  of the phase.
 - **Entities** reserved by systems running at the same time would be handed
   out in an order that depends on timing. So reserving entities counts as a
   conflict, and systems with `Commands`, or with `&World`, which can make a
@@ -258,7 +264,10 @@ become ready, under one mutex, and wait on a condition variable otherwise.
 Each system sits behind a mutex of its own, so the threads can share the list
 while each system is only ever run by one of them. A panicking system is
 caught, stops the others from starting, and is passed on once those running
-have finished.
+have finished. The systems that finished still remember running, and the
+commands recorded during the run are dropped when the schedule next runs:
+they belong to a frame that never finished, and a game that recovers by
+restoring a snapshot must not see them applied to the next one.
 
 Writes through a shared world are sound because the scheduler only runs a
 system alongside systems it does not conflict with. Resources sit in
@@ -327,7 +336,10 @@ Ticks are left out. Change detection only ever compares ticks with each
 other, so code that moves the world's tick without writing anything, such as
 systems that read the world to draw it, cannot affect the simulation; leaving
 the ticks out keeps it from affecting the checksum too, so that a peer that
-draws agrees with one that does not.
+draws agrees with one that does not. The price is that peers that only
+diverge in which components changed agree until that leads to different
+values, and that a component holding a `Tick` brings its absolute value back
+in.
 
 Two worlds that cannot be told apart can still have different component ids,
 for example when one of them used a component type for the first time in
@@ -414,5 +426,6 @@ Debug builds assert invariant 2 after every structural change.
 
 ## Not yet implemented
 
-Events, and systems ordered other than by when they were added. See the
-roadmap in the README.
+Events, systems ordered other than by when they were added, and a thread pool
+that outlives a schedule's run: each shared phase spawns its threads anew.
+See the roadmap in the README.

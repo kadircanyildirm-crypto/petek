@@ -27,7 +27,8 @@ and this project adheres to
 - Commands: a `CommandQueue` records spawns, inserts, removals, despawns and
   resource changes to apply later, for example after a query is done, and
   `Query::commands` lets them be recorded while any query runs. Spawning
-  through commands hands out the new entity right away.
+  through commands hands out the new entity right away, and
+  `CommandQueue::clear` drops commands without applying them.
 - Change detection: `Added` and `Changed` query filters, and the `Mut` smart
   pointer that marks a component as changed when it is written through.
   Queries for `&mut T` and `World::get_mut` now yield `Mut<T>`.

@@ -704,7 +704,9 @@ impl World {
     ///
     /// Peers that simulate the same world in lockstep, or with rollback, can
     /// exchange checksums now and then: if theirs differ, so do their worlds,
-    /// and the simulation has diverged.
+    /// and the simulation has diverged. Equal checksums are no proof of
+    /// equal worlds, as the checksum only covers what is registered for
+    /// it, and leaves out ticks (see below).
     ///
     /// ```
     /// use petek::{Component, World};
@@ -736,7 +738,13 @@ impl World {
     /// world's tick without writing anything, such as a schedule of systems
     /// that only read the world to draw it, cannot change the simulation. It
     /// cannot change the checksum either, so a peer that draws and one that
-    /// does not still agree.
+    /// does not still agree. Two things follow:
+    ///
+    /// - If peers diverge only in which components changed, for example
+    ///   because one wrote a value that was already there, the checksums only
+    ///   differ once that leads to different values.
+    /// - Components and resources should not hold a [`Tick`], which would
+    ///   bring its absolute value into the checksum.
     ///
     /// Worlds that cannot be told apart have the same checksum, as long as
     /// they registered the same types for checksums in the same order, and

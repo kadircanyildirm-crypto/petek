@@ -131,7 +131,8 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// - For `'w`, the caller must hold the access that `D` reports, and `D`
     ///   must not access any component mutably more than once (see
     ///   [`check_access`]).
-    /// - `ticks.this_run` must not be older than any tick in the world.
+    /// - `ticks.this_run` must not be older than any tick of the components
+    ///   that `D` accesses.
     pub(crate) unsafe fn new(
         world: &'w World,
         data: Option<D::State>,

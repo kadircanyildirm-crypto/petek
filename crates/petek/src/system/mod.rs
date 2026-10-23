@@ -111,7 +111,8 @@ pub trait System: sealed::System + Send + 'static {
     ///   system reads, or access what it writes. If the system reserves
     ///   entities, no one else may either.
     /// - `ticks.last_run` must be the tick at which the system last ran, and
-    ///   `ticks.this_run` a tick newer than any in the world.
+    ///   `ticks.this_run` a tick newer than any tick of what the system
+    ///   accesses.
     unsafe fn run_unsafe(&mut self, world: &World, ticks: Ticks);
 
     /// Runs the system, which must be exclusive.

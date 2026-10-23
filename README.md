@@ -92,7 +92,8 @@ change ticks.
 - A schedule's result is the same on any number of threads as running its
   systems one after another, in the order they were added: systems that
   conflict keep that order, each runs at a tick assigned in that order, and
-  two systems that spawn entities never run at the same time.
+  two systems that spawn entities never run at the same time. Only interior
+  mutability, such as a `Mutex` in a resource, escapes this.
 - Change detection counts writes with a 64-bit tick that only moves when the
   world is written to, so it cannot wrap around or drift between machines.
 - Restoring a snapshot brings back everything, down to the order archetypes

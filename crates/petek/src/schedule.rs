@@ -17,13 +17,15 @@ use crate::world::{World, WorldId};
 /// A list of systems to run on a world, in parallel where their parameters
 /// allow.
 ///
-/// Running a schedule always has the same result as running its systems one
-/// after another, in the order they were added, however many threads it
-/// uses:
+/// Running a schedule has the same result as running its systems one after
+/// another, in the order they were added, however many threads it uses:
 ///
 /// - Systems that conflict, because one of them writes something the other
 ///   accesses, run in the order they were added. Others may run at the same
-///   time, as they cannot affect each other.
+///   time, as they cannot affect each other, unless components or resources
+///   share state through interior mutability, such as a `Mutex` or an
+///   atomic: two systems that only read such a resource can still both
+///   change it, in either order.
 /// - Each system runs at its own tick, in the order the systems were added,
 ///   whichever finishes first.
 /// - Systems that take [`Commands`](crate::command::Commands) never run at
@@ -69,7 +71,9 @@ use crate::world::{World, WorldId};
 /// ```
 ///
 /// A schedule belongs to the world it first runs with, and running it with
-/// another world panics.
+/// another world panics. Each of its systems keeps its last run in that world
+/// for good, from the first time it runs, so build a schedule once and run it
+/// every frame, rather than building one each time.
 pub struct Schedule {
     systems: Vec<Box<dyn System>>,
     /// The world the systems were initialized with, if any.
