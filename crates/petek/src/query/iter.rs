@@ -37,6 +37,13 @@ struct Current<'w, D: QueryData, F: QueryFilter> {
 /// [`Changed`](super::Changed), the number of items left is known exactly,
 /// though computing it takes time proportional to the number of archetypes
 /// left.
+///
+/// [`for_each`](Iterator::for_each), and adapters that use
+/// [`fold`](Iterator::fold), such as `sum`, run faster than a `for` loop:
+/// they visit each archetype in a tight loop of their own, while a `for`
+/// loop calls [`next`](Iterator::next) for each entity, which keeps its
+/// place in memory between calls. On a single archetype, the `petek`
+/// benchmarks measure about a third more time for a `for` loop.
 pub struct QueryIter<'w, 's, D: QueryData, F: QueryFilter = ()> {
     /// `None` if the query cannot match anything, because some of its
     /// components are not registered.

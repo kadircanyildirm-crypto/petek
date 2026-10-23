@@ -93,6 +93,15 @@ fn iterate(c: &mut Criterion) {
             }
         });
     });
+    group.bench_function("petek_for_each", |b| {
+        b.iter(|| {
+            query.iter_mut(&mut world).for_each(|(mut position, velocity)| {
+                position.0 += velocity.0;
+                position.1 += velocity.1;
+                position.2 += velocity.2;
+            });
+        });
+    });
 
     let mut world = hecs::World::new();
     world.spawn_batch((0..ENTITIES).map(moving)).for_each(drop);
@@ -160,6 +169,11 @@ fn iterate_fragmented(c: &mut Criterion) {
             for mut data in query.iter_mut(&mut world) {
                 data.0 *= 2.0;
             }
+        });
+    });
+    group.bench_function("petek_for_each", |b| {
+        b.iter(|| {
+            query.iter_mut(&mut world).for_each(|mut data| data.0 *= 2.0);
         });
     });
 
