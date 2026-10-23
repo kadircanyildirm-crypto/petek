@@ -77,7 +77,7 @@ pub use filter::{Added, ArchetypeFilter, Changed, Or, QueryFilter, With, Without
 pub use iter::QueryIter;
 pub use state::QueryState;
 
-pub(crate) use data::Access;
+pub(crate) use data::{Access, Presence};
 use iter::Matched;
 
 /// Keeps the query traits from being implemented outside of this crate, since

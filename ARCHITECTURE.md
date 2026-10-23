@@ -224,6 +224,15 @@ alias a mutable reference. Two parameters conflict when one writes what the
 other accesses, much like two queries; parameters of one system may both
 reserve entities, since one thread uses them in a fixed order.
 
+Queries are kept apart in a `SystemAccess`, each with the components that
+every archetype it matches has, or that none has, as its data and filters
+report them. Two queries of which one requires a component that the other
+excludes never match the same archetype, so they never touch the same row,
+and do not conflict whatever they access: `Query<&mut Position,
+With<Player>>` and `Query<&mut Position, Without<Player>>` can be used
+together, in one system or in two that run at the same time. Only what
+`matches` enforces may be reported, so `Option` and `Or` report nothing.
+
 Turning a function into a system takes a trick, the same as in Bevy: a
 function `fn(Query<&A>)` is generic over the lifetimes it borrows, so
 `SystemParamFunction` requires both `FnMut(P)`, which fixes the parameter

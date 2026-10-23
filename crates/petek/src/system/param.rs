@@ -4,7 +4,7 @@ use std::any::type_name;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 
-use super::access::{SystemAccess, SystemMeta};
+use super::access::{QueryAccess, SystemAccess, SystemMeta};
 use super::sealed;
 use crate::change::{Mut, Tick, Ticks};
 use crate::command::{CommandQueue, Commands};
@@ -40,8 +40,31 @@ pub struct SystemRun {
 ///
 /// A system whose parameters conflict, because one of them writes something
 /// that another accesses, panics when it is first run: using both at once
-/// could alias a mutable reference. Queries count as accessing every
-/// component they name, whichever entities they match.
+/// could alias a mutable reference.
+///
+/// Two queries never conflict if they cannot match the same entity, because
+/// one requires a component, with `&T`, `&mut T`, [`With<T>`](crate::query::With)
+/// or a change filter, that the other excludes with
+/// [`Without<T>`](crate::query::Without). Optional components and
+/// [`Or`](crate::query::Or) filters require nothing:
+///
+/// ```
+/// # use petek::query::{Query, With, Without};
+/// # use petek::{Component, World};
+/// # struct Position(f32);
+/// # impl Component for Position {}
+/// # struct Player;
+/// # impl Component for Player {}
+/// fn follow_player(
+///     player: Query<&mut Position, With<Player>>,
+///     others: Query<&mut Position, Without<Player>>,
+/// ) {
+///     // Both write positions, but never those of the same entity.
+/// }
+/// # let mut schedule = petek::schedule::Schedule::new();
+/// # schedule.add_system(follow_player);
+/// # schedule.run(&mut World::new());
+/// ```
 ///
 /// This trait is sealed, because the soundness of the scheduler relies on its
 /// implementations: it cannot be implemented outside of `petek`.
@@ -99,8 +122,11 @@ impl<D: QueryData + 'static, F: QueryFilter + 'static> SystemParam for Query<'_,
 
     fn init_state(world: &mut World, meta: &mut SystemMeta) -> Self::State {
         let state = QueryState::new(world);
+        let mut query = QueryAccess::default();
+        state.visit_access(&mut |id, how| query.add_component(id, how));
+        state.visit_presence(&mut |id, presence| query.add_presence(id, presence));
         let mut access = SystemAccess::default();
-        state.visit_access(&mut |id, how| access.add_component(id, how));
+        access.add_query(query);
         meta.add_param(&access, world);
         state
     }

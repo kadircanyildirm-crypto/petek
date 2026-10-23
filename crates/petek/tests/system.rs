@@ -4,7 +4,7 @@ use std::panic;
 use std::sync::{Arc, Mutex};
 
 use petek::command::Commands;
-use petek::query::{Added, Changed, Query, With};
+use petek::query::{Added, Changed, Query, With, Without};
 use petek::schedule::Schedule;
 use petek::system::{Res, ResMut};
 use petek::{Component, Entity, Resource, World};
@@ -97,6 +97,57 @@ fn systems_can_read_the_whole_world_or_take_it_exclusively() {
 #[should_panic(expected = "parameters that both access `system::Pos`")]
 fn parameters_that_alias_are_rejected() {
     run_once(&mut World::new(), |_: Query<&mut Pos>, _: Query<&Pos>| {});
+}
+
+#[test]
+fn queries_that_cannot_match_the_same_entity_may_both_write() {
+    let mut world = World::new();
+    let tagged = world.spawn((Pos(0), Tag(0)));
+    let untagged = world.spawn(Pos(0));
+    let typed = world.spawn((Pos(0), Vel(0)));
+
+    // `With` and `Without`, and `&Tag` against `Without<Tag>`, keep each pair
+    // of queries on different archetypes, so both can be used at once.
+    run_once(
+        &mut world,
+        |with: Query<&mut Pos, With<Tag>>, without: Query<&mut Pos, Without<Tag>>| {
+            for (mut a, mut b) in with.into_iter().zip(without) {
+                a.0 += 1;
+                b.0 -= 1;
+            }
+        },
+    );
+    run_once(
+        &mut world,
+        |vel: Query<(&mut Pos, &Vel)>, no_vel: Query<&mut Pos, Without<Vel>>| {
+            vel.into_iter().for_each(|(mut pos, _)| pos.0 += 10);
+            no_vel.into_iter().for_each(|mut pos| pos.0 += 100);
+        },
+    );
+    assert_eq!(world.get::<Pos>(tagged), Some(&Pos(101)));
+    assert_eq!(world.get::<Pos>(untagged), Some(&Pos(99)));
+    // `zip` stops after the one tagged entity, so `typed` only moved once.
+    assert_eq!(world.get::<Pos>(typed), Some(&Pos(10)));
+}
+
+#[test]
+fn optional_components_and_or_filters_do_not_keep_queries_apart() {
+    type TaggedOrMoving = petek::query::Or<(With<Tag>, With<Vel>)>;
+
+    // Both of these can match an entity that has a `Pos` but no `Tag`.
+    let optional = panic::catch_unwind(|| {
+        run_once(
+            &mut World::new(),
+            |_: Query<(&mut Pos, Option<&Tag>)>, _: Query<&mut Pos, Without<Tag>>| {},
+        );
+    });
+    let or = panic::catch_unwind(|| {
+        run_once(
+            &mut World::new(),
+            |_: Query<&mut Pos, TaggedOrMoving>, _: Query<&mut Pos, Without<Tag>>| {},
+        );
+    });
+    assert!(optional.is_err() && or.is_err());
 }
 
 #[test]

@@ -81,6 +81,14 @@ fn flip_a_with_c(query: Query<&mut A, With<C>>) {
     }
 }
 
+/// Writes `A` too, but never on the same entities as `flip_a_with_c`, so the
+/// two may run at the same time.
+fn rotate_a_without_c(query: Query<&mut A, Without<C>>) {
+    for mut a in query {
+        a.0 = a.0.rotate_left(3);
+    }
+}
+
 fn log_a(mut log: ResMut<Log>, query: Query<(Entity, &A)>) {
     let mut state = 0;
     for (entity, a) in query {
@@ -160,6 +168,7 @@ fn new_schedule(threads: usize) -> Schedule {
         .add_system(reseed)
         .add_system(spawn_from_c)
         .add_system(flip_a_with_c)
+        .add_system(rotate_a_without_c)
         .add_system(log_a)
         .add_system(despawn_some)
         .add_system(grow_c)

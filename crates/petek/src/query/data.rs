@@ -55,6 +55,16 @@ pub trait QueryData: sealed::Data {
     #[doc(hidden)]
     fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access));
 
+    /// Calls `f` with components that every archetype the query matches
+    /// has, or that none of them has.
+    ///
+    /// Two queries of which one requires a component that the other excludes
+    /// never match the same archetype, so they can never access the same
+    /// row. This must only report what [`matches`](Self::matches) enforces;
+    /// leaving something out is always sound.
+    #[doc(hidden)]
+    fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence));
+
     /// Returns `true` if the query yields an item for every entity of the
     /// archetype.
     #[doc(hidden)]
@@ -124,6 +134,15 @@ pub enum Access {
     Write,
 }
 
+/// Whether the archetypes a query matches have a component.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Presence {
+    /// Every archetype the query matches has the component.
+    Required,
+    /// No archetype the query matches has the component.
+    Excluded,
+}
+
 /// A pointer to the first item of a column of `T`s, from which a query fetches
 /// `&T` or `&mut T` items.
 ///
@@ -185,6 +204,10 @@ impl<T: Component> QueryData for &T {
         f(id, Access::Read);
     }
 
+    fn visit_presence(&id: &ComponentId, f: &mut impl FnMut(ComponentId, Presence)) {
+        f(id, Presence::Required);
+    }
+
     fn matches(&id: &ComponentId, archetype: &Archetype) -> bool {
         archetype.contains(id)
     }
@@ -221,6 +244,10 @@ impl<T: Component> QueryData for &mut T {
 
     fn visit_access(&id: &ComponentId, f: &mut impl FnMut(ComponentId, Access)) {
         f(id, Access::Write);
+    }
+
+    fn visit_presence(&id: &ComponentId, f: &mut impl FnMut(ComponentId, Presence)) {
+        f(id, Presence::Required);
     }
 
     fn matches(&id: &ComponentId, archetype: &Archetype) -> bool {
@@ -278,6 +305,8 @@ impl QueryData for Entity {
 
     fn visit_access((): &(), _: &mut impl FnMut(ComponentId, Access)) {}
 
+    fn visit_presence((): &(), _: &mut impl FnMut(ComponentId, Presence)) {}
+
     fn matches((): &(), _: &Archetype) -> bool {
         true
     }
@@ -318,6 +347,9 @@ impl<D: QueryData> QueryData for Option<D> {
             D::visit_access(state, f);
         }
     }
+
+    /// `Option<D>` matches every archetype, whatever `D` requires.
+    fn visit_presence(_: &Self::State, _: &mut impl FnMut(ComponentId, Presence)) {}
 
     fn matches(_: &Self::State, _: &Archetype) -> bool {
         true
@@ -360,6 +392,8 @@ impl QueryData for () {
 
     fn visit_access((): &(), _: &mut impl FnMut(ComponentId, Access)) {}
 
+    fn visit_presence((): &(), _: &mut impl FnMut(ComponentId, Presence)) {}
+
     fn matches((): &(), _: &Archetype) -> bool {
         true
     }
@@ -401,6 +435,12 @@ macro_rules! impl_query_data_for_tuples {
                 let ($first, $($rest,)*) = state;
                 $first::visit_access($first, f);
                 $($rest::visit_access($rest, f);)*
+            }
+
+            fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence)) {
+                let ($first, $($rest,)*) = state;
+                $first::visit_presence($first, f);
+                $($rest::visit_presence($rest, f);)*
             }
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {

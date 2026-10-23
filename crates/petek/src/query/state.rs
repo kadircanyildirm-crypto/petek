@@ -3,7 +3,7 @@
 use std::any::type_name;
 use std::fmt;
 
-use super::data::Access;
+use super::data::{Access, Presence};
 use super::iter::Matched;
 use super::{
     Query, QueryData, QueryError, QueryFilter, QueryIter, ReadOnlyQueryData, check_access,
@@ -205,6 +205,13 @@ impl<D: QueryData, F: QueryFilter> QueryState<D, F> {
     pub(crate) fn visit_access(&self, f: &mut impl FnMut(ComponentId, Access)) {
         D::visit_access(&self.data, f);
         F::visit_access(&self.filter, f);
+    }
+
+    /// Calls `f` with components that every archetype the query matches
+    /// has, or that none of them has.
+    pub(crate) fn visit_presence(&self, f: &mut impl FnMut(ComponentId, Presence)) {
+        D::visit_presence(&self.data, f);
+        F::visit_presence(&self.filter, f);
     }
 
     /// Iterates over the matching entities, without checking anything.

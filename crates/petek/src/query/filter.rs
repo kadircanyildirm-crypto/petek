@@ -4,7 +4,7 @@ use std::any::{TypeId, type_name};
 use std::fmt;
 use std::marker::PhantomData;
 
-use super::data::Access;
+use super::data::{Access, Presence};
 use super::sealed;
 use crate::archetype::Archetype;
 use crate::change::{Tick, TickSlice, Ticks};
@@ -55,6 +55,13 @@ pub trait QueryFilter: sealed::Filter {
     /// change with exclusive access to the world.
     #[doc(hidden)]
     fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access));
+
+    /// Calls `f` with components that every archetype the filter lets
+    /// through has, or that none of them has. As for
+    /// [`QueryData`](super::QueryData), this must only report what
+    /// [`matches`](Self::matches) enforces.
+    #[doc(hidden)]
+    fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence));
 
     /// Returns `true` if the filter may let entities of the archetype
     /// through. Unless the filter is archetypal, it still checks each row.
@@ -201,6 +208,12 @@ impl<T: Component> QueryFilter for With<T> {
 
     fn visit_access(_: &Self::State, _: &mut impl FnMut(ComponentId, Access)) {}
 
+    fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence)) {
+        if let Some(id) = *state {
+            f(id, Presence::Required);
+        }
+    }
+
     fn matches(state: &Self::State, archetype: &Archetype) -> bool {
         state.is_some_and(|id| archetype.contains(id))
     }
@@ -232,6 +245,12 @@ impl<T: Component> QueryFilter for Without<T> {
     }
 
     fn visit_access(_: &Self::State, _: &mut impl FnMut(ComponentId, Access)) {}
+
+    fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence)) {
+        if let Some(id) = *state {
+            f(id, Presence::Excluded);
+        }
+    }
 
     fn matches(state: &Self::State, archetype: &Archetype) -> bool {
         state.is_none_or(|id| !archetype.contains(id))
@@ -269,6 +288,12 @@ macro_rules! impl_tick_filter {
             fn visit_access(state: &Self::State, f: &mut impl FnMut(ComponentId, Access)) {
                 if let Some(id) = *state {
                     f(id, Access::Read);
+                }
+            }
+
+            fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence)) {
+                if let Some(id) = *state {
+                    f(id, Presence::Required);
                 }
             }
 
@@ -315,6 +340,8 @@ impl QueryFilter for () {
 
     fn visit_access((): &(), _: &mut impl FnMut(ComponentId, Access)) {}
 
+    fn visit_presence((): &(), _: &mut impl FnMut(ComponentId, Presence)) {}
+
     fn matches((): &(), _: &Archetype) -> bool {
         true
     }
@@ -358,6 +385,12 @@ macro_rules! impl_query_filter_for_tuples {
                 let ($first, $($rest,)*) = state;
                 $first::visit_access($first, f);
                 $($rest::visit_access($rest, f);)*
+            }
+
+            fn visit_presence(state: &Self::State, f: &mut impl FnMut(ComponentId, Presence)) {
+                let ($first, $($rest,)*) = state;
+                $first::visit_presence($first, f);
+                $($rest::visit_presence($rest, f);)*
             }
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {
@@ -424,6 +457,10 @@ macro_rules! impl_query_filter_for_tuples {
                 $first::visit_access($first, f);
                 $($rest::visit_access($rest, f);)*
             }
+
+            /// An archetype only has to pass one of the filters, so `Or`
+            /// promises nothing about which components it has.
+            fn visit_presence(_: &Self::State, _: &mut impl FnMut(ComponentId, Presence)) {}
 
             fn matches(state: &Self::State, archetype: &Archetype) -> bool {
                 let ($first, $($rest,)*) = state;
