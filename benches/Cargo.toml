@@ -1,0 +1,25 @@
+[package]
+name = "petek-benches"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Benchmarks of petek, against hecs and bevy_ecs where they compare"
+
+# A workspace of its own, so that the crates compared against stay out of the
+# main workspace's MSRV and Miri builds.
+[workspace]
+
+[dependencies]
+petek = { path = "../crates/petek" }
+
+[dev-dependencies]
+bevy_ecs = "0.20"
+criterion = "0.8"
+hecs = "0.11"
+
+[[bench]]
+name = "ecs"
+harness = false
+
+[profile.bench]
+debug = true

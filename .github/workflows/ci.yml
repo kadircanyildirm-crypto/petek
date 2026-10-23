@@ -82,6 +82,18 @@ jobs:
         env:
           MIRIFLAGS: -Zmiri-strict-provenance ${{ matrix.flags }}
 
+  # The benchmarks live in a workspace of their own, since the crates they
+  # compare against would not build on the MSRV or under Miri.
+  benches:
+    name: Benchmarks build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --manifest-path benches/Cargo.toml --benches
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
