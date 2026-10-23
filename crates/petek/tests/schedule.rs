@@ -209,6 +209,29 @@ fn any_number_of_threads_gives_the_same_world() {
 }
 
 #[test]
+fn systems_that_only_read_do_not_change_the_checksum() {
+    fn draw(query: Query<(&A, Option<&B>)>, seed: Res<Seed>, world: &World) {
+        let _ = (query.iter().count(), seed.0, world.len());
+    }
+
+    let frames = if cfg!(miri) { 3 } else { 10 };
+    let (mut headless, mut simulation) = (new_world(), new_schedule(2));
+    let (mut drawn, mut drawn_simulation) = (new_world(), new_schedule(2));
+    let mut drawing = Schedule::new();
+    drawing.add_system(draw).add_system(draw);
+    for _ in 0..frames {
+        simulation.run(&mut headless);
+        drawn_simulation.run(&mut drawn);
+        drawing.run(&mut drawn);
+    }
+
+    // Drawing moved the tick, but the simulation came out the same.
+    let (headless, drawn) = (dump(&headless), dump(&drawn));
+    assert_ne!(headless.2, drawn.2);
+    assert_eq!((headless.0, headless.1), (drawn.0, drawn.1));
+}
+
+#[test]
 fn a_panicking_system_does_not_hang_the_schedule() {
     static FAIL: AtomicBool = AtomicBool::new(true);
 

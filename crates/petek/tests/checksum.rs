@@ -114,11 +114,16 @@ fn entities_and_their_order_are_covered() {
 }
 
 #[test]
-fn the_tick_is_covered() {
+fn ticks_are_left_out() {
+    // Moving the world's tick, or marking a component as changed, writes
+    // nothing a simulation could tell apart.
+    let base = checksum_after(|_, _| {});
     let read = checksum_after(|world, first| {
         let _ = world.get_mut::<Pos>(first);
     });
-    assert_ne!(read, checksum_after(|_, _| {}));
+    let rewritten = checksum_after(|world, first| world.insert(first, Pos(1)).unwrap());
+    assert_eq!(read, base);
+    assert_eq!(rewritten, base);
 }
 
 /// A component with fields of many kinds and widths, none of which the
@@ -160,7 +165,7 @@ fn checksums_are_the_same_on_every_platform() {
     world.spawn((Pos(2), Vel(-2)));
     world.despawn(scout).unwrap();
     world.insert_resource(Seed(u64::MAX - 1));
-    assert_eq!(world.checksum(), 0xcb6d_3ae3_d72c_4eed);
+    assert_eq!(world.checksum(), 0x88c0_350d_3ca5_9045);
 }
 
 #[test]

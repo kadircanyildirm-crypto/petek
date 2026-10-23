@@ -618,8 +618,10 @@ impl World {
         Snapshot {
             world: self.id,
             entities,
-            // SAFETY: queries that write hold the world exclusively, so with
-            // `&self` held, no one is writing any component.
+            // SAFETY: no one writes components while safe code holds
+            // `&World`: writing takes `&mut World`, or a system parameter, and
+            // schedules never run a system that writes alongside one that
+            // takes `&World`.
             archetypes: unsafe { self.archetypes.snapshot(&self.components) },
             resources: self.resources.snapshot(),
             change_tick: self.change_tick,
@@ -722,12 +724,17 @@ impl World {
     /// assert_ne!(here.checksum(), there.checksum());
     /// ```
     ///
-    /// The checksum covers the entities, the order they are stored in, and
-    /// the world's tick. Of the components and resources, it only covers
-    /// those whose types are registered with
-    /// [`register_hash`](Self::register_hash) and
-    /// [`register_resource_hash`](Self::register_resource_hash). It leaves
-    /// out the ticks at which individual components changed.
+    /// The checksum covers the entities and the order they are stored in.
+    /// Of the components and resources, it only covers those whose types are
+    /// registered with [`register_hash`](Self::register_hash) and
+    /// [`register_resource_hash`](Self::register_resource_hash).
+    ///
+    /// It leaves out ticks, of the world and of what is in it. Change
+    /// detection only compares ticks with each other, so what moves the
+    /// world's tick without writing anything, such as a schedule of systems
+    /// that only read the world to draw it, cannot change the simulation. It
+    /// cannot change the checksum either, so a peer that draws and one that
+    /// does not still agree.
     ///
     /// Worlds that cannot be told apart have the same checksum, as long as
     /// they registered the same types for checksums in the same order, and
@@ -747,10 +754,9 @@ impl World {
     #[must_use]
     pub fn checksum(&self) -> u64 {
         let mut hasher = ChecksumHasher::new();
-        self.change_tick.hash(&mut hasher);
         self.entities.hash(&mut hasher);
-        // SAFETY: queries that write hold the world exclusively, so with
-        // `&self` held, no one is writing any component.
+        // SAFETY: as in `snapshot`, no one writes components while safe code
+        // holds `&World`.
         unsafe { self.archetypes.hash(&self.components, &mut hasher) };
         self.resources.hash(&mut hasher);
         hasher.finish()

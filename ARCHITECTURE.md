@@ -242,10 +242,16 @@ can miss changes, and a `CommandQueue` keeps its commands. `QueryState` is
 
 ## Checksums
 
-`World::checksum` hashes the world's tick, the entity allocator, every
-archetype's entities in order, and the components and resources whose types
-are registered with `register_hash` or `register_resource_hash`. Peers that
-compare checksums can tell that their worlds diverged.
+`World::checksum` hashes the entity allocator, every archetype's entities in
+order, and the components and resources whose types are registered with
+`register_hash` or `register_resource_hash`. Peers that compare checksums can
+tell that their worlds diverged.
+
+Ticks are left out. Change detection only ever compares ticks with each
+other, so code that moves the world's tick without writing anything, such as
+systems that read the world to draw it, cannot affect the simulation; leaving
+the ticks out keeps it from affecting the checksum too, so that a peer that
+draws agrees with one that does not.
 
 Two worlds that cannot be told apart can still have different component ids,
 for example when one of them used a component type for the first time in
