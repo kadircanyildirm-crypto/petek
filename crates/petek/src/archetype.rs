@@ -731,8 +731,8 @@ impl Archetypes {
     /// Makes the archetypes those of a snapshot of this world, with the
     /// contents in `snapshot`, a clone of it.
     ///
-    /// Archetypes are kept, and keep their cached transitions, as long as
-    /// they match the snapshot's. The rest are removed, and those the world
+    /// Archetypes are kept as long as they match the snapshot's. The rest are
+    /// removed, and with them every cached transition, and those the world
     /// lacks are created. Each archetype's contents are then swapped with the
     /// matching contents in `snapshot`.
     ///

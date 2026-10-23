@@ -512,6 +512,10 @@ impl World {
 
     /// Registers the component type `C` for [snapshots](Self::snapshot),
     /// which copy components by cloning them.
+    ///
+    /// Registering every component type at startup, in the same order on
+    /// every peer, also gives the types the same ids everywhere, so that one
+    /// entity's components are cloned and dropped in the same order too.
     pub fn register_clone<C: Component + Clone>(&mut self) {
         self.components.register_clone::<C>();
     }
@@ -562,13 +566,29 @@ impl World {
     /// [`register_clone`](Self::register_clone) and
     /// [`register_resource_clone`](Self::register_resource_clone).
     ///
+    /// Commands waiting in a [`CommandQueue`](crate::command::CommandQueue)
+    /// are not part of the world, so take snapshots once the queues are
+    /// applied. Snapshotting while some of their entities are reserved but not
+    /// spawned yet panics: restoring such a snapshot would bring back the
+    /// reservations without the commands that fill them.
+    ///
     /// # Panics
     ///
     /// If the world holds a component or resource whose type is not
-    /// registered. If cloning one panics, the panic is passed on.
+    /// registered, or if entities reserved by commands are waiting to be
+    /// spawned. If cloning a component or resource panics, the panic is
+    /// passed on.
     #[must_use]
     #[track_caller]
     pub fn snapshot(&self) -> Snapshot {
+        // Checking the copy rather than the world means that reservations
+        // made meanwhile on other threads cannot slip in.
+        let mut entities = self.entities.clone();
+        assert!(
+            entities.pending() == 0,
+            "cannot snapshot a world while entities reserved by commands are waiting to be \
+             spawned: apply the command queues that reserved them first",
+        );
         if let Some(name) = self.archetypes.uncloneable(&self.components) {
             panic!(
                 "cannot snapshot a world holding `{name}` components: \
@@ -583,7 +603,7 @@ impl World {
         }
         Snapshot {
             world: self.id,
-            entities: self.entities.clone(),
+            entities,
             // SAFETY: queries that write hold the world exclusively, so with
             // `&self` held, no one is writing any component.
             archetypes: unsafe { self.archetypes.snapshot(&self.components) },
@@ -686,11 +706,21 @@ impl World {
     /// [`register_resource_hash`](Self::register_resource_hash). It leaves
     /// out the ticks at which individual components changed.
     ///
-    /// Worlds that cannot be told apart have the same checksum on any
-    /// platform with the same byte order, as long as the types are registered
-    /// in the same order, and their `Hash` implementations do not depend on
-    /// the platform themselves. The algorithm is not cryptographic, and may
-    /// change between versions of this crate.
+    /// Worlds that cannot be told apart have the same checksum, as long as
+    /// they registered the same types for checksums in the same order, and
+    /// run the same code built with the same version of Rust: the standard
+    /// library's `Hash` implementations may change between versions.
+    ///
+    /// Integers are hashed by value, so a field hashes the same on every
+    /// platform, whatever its width. The standard library hashes slices,
+    /// arrays and `Vec`s of integers as their bytes in memory, though, which
+    /// depend on the byte order and, for `usize` and `isize`, on the pointer
+    /// width. When peers run on different platforms, such as natively and in a
+    /// browser, implement `Hash` for components that hold those by hashing
+    /// the elements one at a time.
+    ///
+    /// The algorithm is not cryptographic, and may change between versions of
+    /// this crate.
     #[must_use]
     pub fn checksum(&self) -> u64 {
         let mut hasher = ChecksumHasher::new();

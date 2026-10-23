@@ -324,20 +324,27 @@ fn a_cloned_query_state_rolls_back_with_the_world() {
 }
 
 #[test]
-fn reserved_entities_are_part_of_the_snapshot() {
+#[should_panic(expected = "while entities reserved by commands are waiting to be spawned")]
+fn snapshots_wait_for_reserved_entities() {
+    // Restoring the reservation without the command that fills it would
+    // leave an entity no resimulation could give its components.
+    let world = new_world();
+    let mut queue = CommandQueue::new();
+    queue.commands(&world).spawn(Pos(1));
+    let _ = world.snapshot();
+}
+
+#[test]
+fn snapshots_hold_what_applied_commands_spawned() {
     let mut world = new_world();
     let mut queue = CommandQueue::new();
-    let reserved = queue.commands(&world).spawn(Pos(1));
+    let spawned = queue.commands(&world).spawn(Pos(1));
+    queue.apply(&mut world);
     let saved = world.snapshot();
 
-    queue.apply(&mut world);
-    assert_eq!(world.get::<Pos>(reserved), Some(&Pos(1)));
-
-    // Back to when the entity was reserved, but its commands not applied.
+    world.despawn(spawned).unwrap();
     world.restore(&saved);
-    assert!(!world.contains(reserved));
-    world.spawn(Vel(0));
-    assert!(world.contains(reserved) && !world.has::<Pos>(reserved));
+    assert_eq!(world.get::<Pos>(spawned), Some(&Pos(1)));
 }
 
 #[test]

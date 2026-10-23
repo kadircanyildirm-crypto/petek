@@ -8,12 +8,16 @@ use std::slice;
 /// [`World::checksum`](crate::World::checksum).
 ///
 /// Peers compare checksums to detect desyncs, so unlike the hasher of the
-/// world's lookup tables, its results must not depend on the platform. It
-/// works on 64-bit words, each made from an integer's value rather than its
-/// bytes in memory, and reads byte slices as little-endian words. Each word is
-/// mixed in like in rustc's `FxHasher`, and the result is finished with
-/// `MurmurHash3`'s 64-bit finalizer, so that every bit of input affects every
-/// bit of output.
+/// world's lookup tables, it does what it can to give the same results on
+/// every platform. It works on 64-bit words, each made from an integer's value
+/// rather than its bytes in memory, and reads byte slices as little-endian
+/// words. That cannot help when a `Hash` implementation passes bytes that
+/// depend on the platform, as the standard library's does for slices of
+/// integers; see [`World::checksum`](crate::World::checksum).
+///
+/// Each word is mixed in like in rustc's `FxHasher`, and the result is
+/// finished with `MurmurHash3`'s 64-bit finalizer, so that every bit of input
+/// affects every bit of output.
 ///
 /// It is not cryptographic: a peer that wants to hide a desync can.
 pub(crate) struct ChecksumHasher {

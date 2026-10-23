@@ -196,13 +196,20 @@ it is applied to another while it holds commands.
 ## Snapshots and rollback
 
 `World::snapshot` copies everything a world holds: the entity allocator, with
-its free list and pending reservations, every archetype's entities and
-columns, ticks included, the resources, and the world's tick. Components and
-resources are copied with `Clone`, through a function registered per type
-with `register_clone`, and a world holding a type that is not registered
+its free list, every archetype's entities and columns, ticks included, the
+resources, and the world's tick. Components and resources are copied with
+`Clone`, through a function registered per type with `register_clone` or
+`register_resource_clone`, and a world holding a type that is not registered
 cannot be snapshotted. Type-erased cloning goes through the same kind of
 function pointer as dropping; if a clone panics, the clones made so far are
 dropped.
+
+A world with pending entity reservations cannot be snapshotted either. The
+commands that would fill the reserved entities live in a `CommandQueue`,
+outside the world, so restoring such a snapshot would bring the reservations
+back without them, and no resimulation could reproduce what followed.
+Snapshots are meant to be taken between frames, once the queues are
+applied.
 
 `World::restore` makes the world indistinguishable from the one the snapshot
 was taken of, which is what lets a rollback be resimulated deterministically:
@@ -214,10 +221,11 @@ was taken of, which is what lets a rollback be resimulated deterministically:
   results of a resimulation. Since a removed archetype's id may be reused by
   another, removing any changes the archetype epoch, and the cached
   transitions are forgotten.
-- **Component types and resource slots** are not rolled back. Their ids are
-  never observable, except through the order of an archetype's columns, which
-  nothing depends on: checksums visit components in their own order (see
-  below).
+- **Component types and resource slots** are not rolled back. Their ids only
+  show in the order of an archetype's columns, and so in the order in which
+  one entity's components are cloned or dropped. Checksums do not depend on
+  them (see below), and registering every component type at startup, in the
+  same order on every peer, fixes them anyway.
 - **Contents**: the snapshot's columns are swapped into archetypes with the
   same component ids, which keeps invariant 3 below. Snapshots can be taken of
   a world after a rollback, and restored in any order.
@@ -236,17 +244,22 @@ can miss changes, and a `CommandQueue` keeps its commands. `QueryState` is
 
 `World::checksum` hashes the world's tick, the entity allocator, every
 archetype's entities in order, and the components and resources whose types
-are registered with `register_hash`. Peers that compare checksums can tell
-that their worlds diverged.
+are registered with `register_hash` or `register_resource_hash`. Peers that
+compare checksums can tell that their worlds diverged.
 
 Two worlds that cannot be told apart can still have different component ids,
 for example when one of them used a component type for the first time in
 frames it then rolled back. So rather than visiting an archetype's columns in
 order, the checksum visits the registered types in the order they were
-registered, and marks each with its position in that order. Its hasher works
-on 64-bit words made from integer values rather than their bytes in memory,
-so that checksums do not depend on the platform; a test pins its output, and
-CI runs it on 32-bit and big-endian targets.
+registered, and marks each with its position in that order.
+
+The hasher works on 64-bit words made from integer values rather than their
+bytes in memory, so that a field hashes the same whatever the platform's byte
+order or pointer width; a test pins the checksum of a whole world, and CI runs
+it on 32-bit and big-endian targets. The standard library undoes that for
+slices, arrays and `Vec`s of integers, which it hashes as their bytes in
+memory, so components that hold those must hash their elements one at a time
+when peers run on different platforms.
 
 ## Determinism
 

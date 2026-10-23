@@ -122,6 +122,48 @@ fn the_tick_is_covered() {
     assert_ne!(read, checksum_after(|_, _| {}));
 }
 
+/// A component with fields of many kinds and widths, none of which the
+/// standard library hashes as bytes in memory.
+#[derive(Hash)]
+struct Unit {
+    id: usize,
+    offset: isize,
+    hp: i16,
+    shield: Option<u8>,
+    name: String,
+    at: (i32, i64),
+}
+impl Component for Unit {}
+
+#[test]
+fn checksums_are_the_same_on_every_platform() {
+    // CI runs this on 32-bit and big-endian targets too.
+    let mut world = new_world();
+    world.register_hash::<Unit>();
+    let scout = Unit {
+        id: 7,
+        offset: -3,
+        hp: -20,
+        shield: Some(2),
+        name: "scout".to_owned(),
+        at: (1, -1),
+    };
+    let tank = Unit {
+        id: 1 << 20,
+        offset: 40_000,
+        hp: 900,
+        shield: None,
+        name: "tank, heavy".to_owned(),
+        at: (-5, 1 << 40),
+    };
+    let scout = world.spawn((scout, Pos(1)));
+    world.spawn(tank);
+    world.spawn((Pos(2), Vel(-2)));
+    world.despawn(scout).unwrap();
+    world.insert_resource(Seed(u64::MAX - 1));
+    assert_eq!(world.checksum(), 0xf129_2d28_2275_e024);
+}
+
 #[test]
 fn checksums_do_not_depend_on_component_ids() {
     // Using `Vel` before registering anything gives it the first id, so the
