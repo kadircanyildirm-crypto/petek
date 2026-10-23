@@ -286,6 +286,40 @@ fn restoring_a_snapshot_rewinds_systems_change_detection() {
 }
 
 #[test]
+fn systems_that_read_the_world_see_their_own_tick() {
+    use petek::query::QueryState;
+
+    for threads in [1, 4] {
+        let mut world = World::new();
+        world.spawn_batch((0..2).map(Pos));
+        world.insert_resource(Frame(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+
+        // A state iterated from a system remembers the world's tick as its
+        // last run, so that tick must be the system's own, not the last of
+        // its schedule's.
+        let mut changed = QueryState::<Entity, Changed<Pos>>::new(&mut world);
+        let log = seen.clone();
+        let mut schedule = Schedule::new();
+        schedule
+            .add_system(move |world: &World| {
+                log.lock().unwrap().push(changed.iter(world).count());
+            })
+            .add_system(|query: Query<&mut Pos>, frame: Res<Frame>| {
+                if frame.0 == 1 {
+                    query.into_iter().for_each(|mut pos| pos.0 += 1);
+                }
+            })
+            .add_system(|mut frame: ResMut<Frame>| frame.0 += 1)
+            .set_threads(threads);
+        for _ in 0..3 {
+            schedule.run(&mut world);
+        }
+        assert_eq!(*seen.lock().unwrap(), [2, 0, 2], "{threads} threads");
+    }
+}
+
+#[test]
 fn commands_apply_before_exclusive_systems_and_at_the_end() {
     struct Marker;
     impl Component for Marker {}

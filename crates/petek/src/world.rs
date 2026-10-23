@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::archetype::{ArchetypeId, Archetypes, TransitionId};
 use crate::bundle::{Bundle, Bundles};
-use crate::change::{Mut, Tick, Ticks};
+use crate::change::{AtomicTick, Mut, Tick, Ticks};
 use crate::checksum::ChecksumHasher;
 use crate::component::{Component, Components};
 use crate::entity::{Entities, Entity, EntityLocation};
@@ -40,8 +40,10 @@ pub struct World {
     bundles: Bundles,
     archetypes: Archetypes,
     resources: Resources,
-    /// Moves forward every time something is written; see [`Tick`].
-    change_tick: Tick,
+    /// Moves forward every time something is written; see [`Tick`]. While a
+    /// schedule runs systems on a shared world, it shows each system that
+    /// reads the world its own tick.
+    change_tick: AtomicTick,
     /// The tick at which each system last ran, so that snapshots rewind
     /// systems' change detection along with the world.
     system_ticks: Vec<Tick>,
@@ -83,7 +85,7 @@ impl World {
             bundles: Bundles::default(),
             archetypes: Archetypes::new(),
             resources: Resources::default(),
-            change_tick: Tick::ZERO,
+            change_tick: AtomicTick::new(Tick::ZERO),
             system_ticks: Vec::new(),
         }
     }
@@ -421,7 +423,7 @@ impl World {
     #[must_use]
     pub fn query<D: ReadOnlyQueryData>(&self) -> Query<'_, D> {
         let data = D::get_state(&self.components);
-        let ticks = one_off_ticks(self.change_tick);
+        let ticks = one_off_ticks(self.change_tick());
         // SAFETY: the state comes from this world, `D` only reads, and `&self`
         // rules out writes for the query's lifetime.
         unsafe { Query::new(self, data, (), ticks) }
@@ -624,7 +626,7 @@ impl World {
             // takes `&World`.
             archetypes: unsafe { self.archetypes.snapshot(&self.components) },
             resources: self.resources.snapshot(),
-            change_tick: self.change_tick,
+            change_tick: self.change_tick(),
             system_ticks: self.system_ticks.as_slice().into(),
         }
     }
@@ -669,7 +671,7 @@ impl World {
         let removed = self.archetypes.restore(&mut archetypes, &self.components);
         self.resources.restore(&mut resources);
         self.entities.clone_from(&snapshot.entities);
-        self.change_tick = snapshot.change_tick;
+        self.change_tick.set(snapshot.change_tick);
         // Systems added since the snapshot was taken had not run back then.
         for (slot, tick) in self.system_ticks.iter_mut().enumerate() {
             *tick = snapshot
@@ -764,27 +766,46 @@ impl World {
 
     /// The world's current tick, which moves forward every time something is
     /// written.
+    ///
+    /// In a system, it is the tick that system runs at, as if the systems of
+    /// its schedule ran one after another.
     #[must_use]
     #[inline]
     pub fn change_tick(&self) -> Tick {
-        self.change_tick
+        self.change_tick.get()
     }
 
     /// Moves the world's tick forward, and returns the new tick, at which the
     /// write that follows happens.
     #[inline]
     pub(crate) fn increment_change_tick(&mut self) -> Tick {
-        self.change_tick = self.change_tick.next();
-        self.change_tick
+        let tick = self.change_tick().next();
+        self.change_tick.set(tick);
+        tick
     }
 
     /// Moves the world's tick forward by `n`, as `n` calls to
     /// [`increment_change_tick`](Self::increment_change_tick) would, and
     /// returns the tick before.
     pub(crate) fn advance_change_tick(&mut self, n: usize) -> Tick {
-        let before = self.change_tick;
-        self.change_tick = before.after(n);
+        let before = self.change_tick();
+        self.change_tick.set(before.after(n));
         before
+    }
+
+    /// Sets the world's tick through a shared reference, to the tick of a
+    /// system that reads the world and is about to run. Only one such system
+    /// runs at a time, and no other system can read the world's tick, so each
+    /// sees its own.
+    #[inline]
+    pub(crate) fn show_system_tick(&self, tick: Tick) {
+        self.change_tick.set(tick);
+    }
+
+    /// Sets the world's tick, after a schedule ran systems on a shared world.
+    #[inline]
+    pub(crate) fn set_change_tick(&mut self, tick: Tick) {
+        self.change_tick.set(tick);
     }
 
     /// Makes room for the ticks of a new system, which has never run, and

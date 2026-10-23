@@ -231,6 +231,64 @@ fn systems_that_only_read_do_not_change_the_checksum() {
     assert_eq!((headless.0, headless.1), (drawn.0, drawn.1));
 }
 
+/// A run of a schedule whose last system panics if `fail` is set, followed
+/// by more runs that do not: how many entities with a `C` each run sees.
+fn runs_after_a_panic(threads: usize, fail: &'static AtomicBool) -> (World, Vec<usize>) {
+    let mut world = World::new();
+    world.spawn_batch((0..3).map(|i| (A(i), C(i))));
+    world.insert_resource(Log(Vec::new()));
+
+    let mut schedule = Schedule::new();
+    schedule
+        .add_system(|query: Query<&mut C, Changed<C>>, mut log: ResMut<Log>| {
+            // Writes every row it sees as changed, which it must not see as
+            // changed again.
+            let mut count = 0;
+            for mut c in query {
+                c.0 += 1;
+                count += 1;
+            }
+            log.0.push(count);
+        })
+        .add_system(|mut commands: Commands| {
+            commands.spawn(B(0));
+        })
+        .add_system(move |query: Query<&C>, log: Res<Log>| {
+            // Runs after both systems above, which it conflicts with.
+            assert!(!fail.swap(false, Ordering::Relaxed), "boom");
+            let _ = (query.iter().count(), log.0.len());
+        })
+        .set_threads(threads);
+    let result = panic::catch_unwind(AssertUnwindSafe(|| schedule.run(&mut world)));
+    assert!(result.is_err());
+    for _ in 0..2 {
+        schedule.run(&mut world);
+    }
+    let seen = world.resource::<Log>().unwrap().0.iter();
+    let seen = seen.map(|&count| usize::try_from(count).unwrap()).collect();
+    (world, seen)
+}
+
+#[test]
+fn systems_that_finished_before_a_panic_remember_running() {
+    static FAIL: [AtomicBool; 2] = [AtomicBool::new(true), AtomicBool::new(true)];
+    for (threads, fail) in [1, 4].into_iter().zip(&FAIL) {
+        let (_, seen) = runs_after_a_panic(threads, fail);
+        assert_eq!(seen, [3, 0, 0], "{threads} threads");
+    }
+}
+
+#[test]
+fn commands_of_a_run_that_panicked_are_dropped() {
+    static FAIL: [AtomicBool; 2] = [AtomicBool::new(true), AtomicBool::new(true)];
+    for (threads, fail) in [1, 4].into_iter().zip(&FAIL) {
+        let (world, _) = runs_after_a_panic(threads, fail);
+        // Two runs finished, each spawning one `B`; the one that panicked
+        // spawned none.
+        assert_eq!(world.query::<&B>().iter().count(), 2, "{threads} threads");
+    }
+}
+
 #[test]
 fn a_panicking_system_does_not_hang_the_schedule() {
     static FAIL: AtomicBool = AtomicBool::new(true);

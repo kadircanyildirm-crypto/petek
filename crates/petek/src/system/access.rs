@@ -40,6 +40,11 @@ impl SystemAccess {
         self.reads_world = true;
     }
 
+    /// Returns `true` if it reads the whole world.
+    pub(crate) fn reads_world(&self) -> bool {
+        self.reads_world
+    }
+
     /// Returns `true` if it writes anything.
     fn writes(&self) -> bool {
         fn writes<K>(list: &[(K, Access)]) -> bool {

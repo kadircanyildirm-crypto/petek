@@ -79,6 +79,12 @@ pub trait SystemParam: sealed::Param {
     fn apply(state: &mut Self::State, world: &mut World) {
         let _ = (state, world);
     }
+
+    /// Drops what the parameter deferred, without applying it.
+    #[doc(hidden)]
+    fn discard(state: &mut Self::State) {
+        let _ = state;
+    }
 }
 
 /// The item a parameter `P` hands to a system that borrows the world for
@@ -371,6 +377,10 @@ impl SystemParam for Commands<'_> {
     fn apply(queue: &mut CommandQueue, world: &mut World) {
         queue.apply(world);
     }
+
+    fn discard(queue: &mut CommandQueue) {
+        queue.clear();
+    }
 }
 
 impl sealed::Param for &World {}
@@ -440,6 +450,12 @@ macro_rules! impl_system_param_for_tuples {
                 let ($first, $($rest,)*) = state;
                 $first::apply($first, world);
                 $($rest::apply($rest, world);)*
+            }
+
+            fn discard(state: &mut Self::State) {
+                let ($first, $($rest,)*) = state;
+                $first::discard($first);
+                $($rest::discard($rest);)*
             }
         }
 

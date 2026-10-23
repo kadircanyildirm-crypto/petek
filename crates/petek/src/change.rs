@@ -4,6 +4,7 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A point in a world's history.
 ///
@@ -44,6 +45,28 @@ impl Tick {
             .and_then(|n| self.0.checked_add(n))
             .expect("change ticks ran out");
         Self(next)
+    }
+}
+
+/// A tick that can be set through a shared reference: the world's current
+/// tick, which a schedule sets to the tick of each system that reads the
+/// world, just before running it.
+#[derive(Debug)]
+pub(crate) struct AtomicTick(AtomicU64);
+
+impl AtomicTick {
+    pub(crate) fn new(tick: Tick) -> Self {
+        Self(AtomicU64::new(tick.0))
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Tick {
+        Tick(self.0.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(crate) fn set(&self, tick: Tick) {
+        self.0.store(tick.0, Ordering::Relaxed);
     }
 }
 

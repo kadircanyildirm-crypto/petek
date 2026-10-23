@@ -106,6 +106,16 @@ impl CommandQueue {
         self.commands.is_empty()
     }
 
+    /// Drops the recorded commands without applying them.
+    ///
+    /// Entities that [`Commands::spawn`] reserved still become alive, without
+    /// components, at the world's next structural change, unless the world
+    /// is [restored](World::restore) to a snapshot from before.
+    pub fn clear(&mut self) {
+        self.commands.clear();
+        self.world = None;
+    }
+
     /// Applies the recorded commands to `world`, in the order they were
     /// recorded, and empties the queue.
     ///

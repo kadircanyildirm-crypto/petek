@@ -119,6 +119,9 @@ pub trait System: sealed::System + Send + 'static {
 
     /// Applies what the system deferred, such as its commands.
     fn apply_deferred(&mut self, world: &mut World);
+
+    /// Drops what the system deferred, without applying it.
+    fn discard_deferred(&mut self);
 }
 
 /// Something that can be turned into a [`System`]: a function whose
@@ -256,6 +259,12 @@ where
             P::apply(&mut state.params, world);
         }
     }
+
+    fn discard_deferred(&mut self) {
+        if let Some(state) = &mut self.state {
+            P::discard(&mut state.params);
+        }
+    }
 }
 
 /// A system made from a function that takes `&mut World`.
@@ -289,6 +298,8 @@ impl<F: FnMut(&mut World) + Send + 'static> System for ExclusiveSystem<F> {
     }
 
     fn apply_deferred(&mut self, _: &mut World) {}
+
+    fn discard_deferred(&mut self) {}
 }
 
 impl fmt::Debug for dyn System {

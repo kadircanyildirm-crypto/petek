@@ -1,6 +1,7 @@
 //! Schedules: lists of systems that run in parallel, with the same result as
 //! running them one after another.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -78,6 +79,9 @@ pub struct Schedule {
     /// How to run the systems, worked out after they are initialized.
     plan: Vec<Phase>,
     threads: NonZeroUsize,
+    /// Whether the last run panicked, leaving behind what systems deferred
+    /// during a frame that never finished.
+    interrupted: bool,
 }
 
 /// A part of a schedule's run.
@@ -98,6 +102,9 @@ struct SharedPhase {
     /// For each system of the phase, the later systems of the phase that
     /// conflict with it, and so wait for it.
     blocks: Vec<Vec<usize>>,
+    /// For each system of the phase, whether it reads the whole world, and so
+    /// can see the world's tick.
+    reads_world: Vec<bool>,
 }
 
 impl Schedule {
@@ -111,6 +118,7 @@ impl Schedule {
             initialized: 0,
             plan: Vec::new(),
             threads: thread::available_parallelism().unwrap_or(NonZeroUsize::MIN),
+            interrupted: false,
         }
     }
 
@@ -150,11 +158,23 @@ impl Schedule {
     /// # Panics
     ///
     /// If the schedule ran with another world before, if the parameters of
-    /// a system conflict, or if a system panics. In the last case, which other
-    /// systems ran is unspecified, but the world stays consistent.
+    /// a system conflict, or if a system or a command panics.
+    ///
+    /// In the last case, which other systems ran is unspecified, but the
+    /// world stays consistent, and the systems that finished remember
+    /// running. The commands recorded during that run are dropped without
+    /// being applied the next time the schedule runs: they belong to a frame
+    /// that never finished, and a game that recovers by restoring a snapshot
+    /// should not see them applied to the next one.
     #[track_caller]
     pub fn run(&mut self, world: &mut World) {
         self.initialize(world);
+        if self.interrupted {
+            for system in &mut self.systems {
+                system.discard_deferred();
+            }
+        }
+        self.interrupted = true;
         // Commands are applied in the order of the systems that recorded
         // them, up to the next exclusive system or the end.
         let mut applied = 0;
@@ -171,6 +191,7 @@ impl Schedule {
             }
         }
         apply_deferred(&mut self.systems[applied..], world);
+        self.interrupted = false;
     }
 
     /// Initializes the systems added since the last run, and plans how to
@@ -232,10 +253,12 @@ fn plan_shared(systems: &[Box<dyn System>], range: Range<usize>) -> SharedPhase 
             }
         }
     }
+    let reads_world = (0..len).map(|index| access(index).reads_world()).collect();
     SharedPhase {
         systems: range,
         waits_for,
         blocks,
+        reads_world,
     }
 }
 
@@ -247,11 +270,10 @@ fn run_shared(
     threads: usize,
 ) {
     let systems = &mut systems[phase.systems.clone()];
+    let len = systems.len();
     // Each system runs at its own tick, in the order the systems were added,
-    // as if they ran one after another. The world's tick moves past them up
-    // front, so that it stays ahead of every tick in the world even if a
-    // system panics.
-    let start = world.advance_change_tick(systems.len());
+    // as if they ran one after another.
+    let start = world.advance_change_tick(len);
     let ticks: Vec<_> = (1..)
         .zip(&*systems)
         .map(|(offset, system)| {
@@ -264,20 +286,72 @@ fn run_shared(
         .collect();
 
     let world_ref: &World = world;
-    if threads == 1 || systems.len() == 1 {
-        for (system, &ticks) in systems.iter_mut().zip(&ticks) {
-            // SAFETY: the systems were initialized with this world. They run
-            // one at a time, so each has the access it needs, and the ticks
-            // were worked out above.
-            unsafe { system.run_unsafe(world_ref, ticks) };
-        }
+    let outcome = if threads == 1 || len == 1 {
+        run_one_by_one(systems, phase, world_ref, &ticks)
     } else {
-        run_parallel(systems, phase, world_ref, &ticks, threads);
-    }
+        run_parallel(systems, phase, world_ref, &ticks, threads)
+    };
 
-    for (system, ticks) in systems.iter().zip(ticks) {
-        let slot = system.tick_slot().expect("shared systems have ticks");
-        world.set_system_last_run(slot, ticks.this_run);
+    // Whether or not a system panicked, the world's tick ends up past every
+    // system of the phase, and the systems that finished remember running.
+    world.set_change_tick(start.after(len));
+    for ((system, ticks), &finished) in systems.iter().zip(ticks).zip(&outcome.finished) {
+        if finished {
+            let slot = system.tick_slot().expect("shared systems have ticks");
+            world.set_system_last_run(slot, ticks.this_run);
+        }
+    }
+    if let Some(payload) = outcome.panic {
+        panic::resume_unwind(payload);
+    }
+}
+
+/// How the run of a shared phase went.
+struct Outcome {
+    /// For each system, whether it finished.
+    finished: Vec<bool>,
+    /// What the first system to panic panicked with.
+    panic: Option<Box<dyn Any + Send>>,
+}
+
+/// Runs one system of a shared phase.
+///
+/// # Safety
+///
+/// The system must have been initialized with `world`, the caller must hold
+/// the access it needs while it runs, and `ticks` must be those `run_shared`
+/// worked out for it. If it reads the whole world, no other system that does
+/// may run at the same time.
+unsafe fn run_system(system: &mut dyn System, world: &World, ticks: Ticks, reads_world: bool) {
+    if reads_world {
+        // It can read the world's tick, which should be its own, as if the
+        // systems ran one after another. No other system that can read the
+        // tick runs at the same time.
+        world.show_system_tick(ticks.this_run);
+    }
+    // SAFETY: the caller upholds `run_unsafe`'s contract.
+    unsafe { system.run_unsafe(world, ticks) };
+}
+
+/// Runs the systems of a shared phase one after another, on this thread.
+fn run_one_by_one(
+    systems: &mut [Box<dyn System>],
+    phase: &SharedPhase,
+    world: &World,
+    ticks: &[Ticks],
+) -> Outcome {
+    let mut finished = vec![false; systems.len()];
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        for (index, system) in systems.iter_mut().enumerate() {
+            // SAFETY: the systems were initialized with this world, and run
+            // one at a time, so each has the access it needs.
+            unsafe { run_system(&mut **system, world, ticks[index], phase.reads_world[index]) };
+            finished[index] = true;
+        }
+    }));
+    Outcome {
+        finished,
+        panic: result.err(),
     }
 }
 
@@ -287,10 +361,9 @@ struct Progress {
     ready: VecDeque<usize>,
     /// For each system, how many systems it still waits for.
     waits_for: Vec<usize>,
-    /// How many systems have finished.
-    finished: usize,
-    /// What the first system to panic panicked with.
-    panic: Option<Box<dyn std::any::Any + Send>>,
+    /// How many systems are left to finish.
+    left: usize,
+    outcome: Outcome,
 }
 
 /// Runs the systems of a shared phase on up to `threads` threads, each
@@ -301,7 +374,7 @@ fn run_parallel(
     world: &World,
     ticks: &[Ticks],
     threads: usize,
-) {
+) -> Outcome {
     let len = systems.len();
     // One lock per system lets the threads share the list, while each system
     // is only ever run by one thread at a time.
@@ -311,8 +384,11 @@ fn run_parallel(
             .filter(|&index| phase.waits_for[index] == 0)
             .collect(),
         waits_for: phase.waits_for.clone(),
-        finished: 0,
-        panic: None,
+        left: len,
+        outcome: Outcome {
+            finished: vec![false; len],
+            panic: None,
+        },
     });
     let changed = Condvar::new();
 
@@ -321,7 +397,7 @@ fn run_parallel(
             let index = {
                 let mut progress = lock(&progress);
                 loop {
-                    if progress.panic.is_some() || progress.finished == len {
+                    if progress.outcome.panic.is_some() || progress.left == 0 {
                         return;
                     }
                     if let Some(index) = progress.ready.pop_front() {
@@ -333,17 +409,27 @@ fn run_parallel(
                 }
             };
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut system = lock(&systems[index]);
                 // SAFETY: the systems were initialized with this world. A
                 // system only becomes ready once every earlier system it
                 // conflicts with has finished, and no later system it
                 // conflicts with starts before it finishes, so it has the
-                // access it needs. The ticks were worked out by `run_shared`.
-                unsafe { lock(&systems[index]).run_unsafe(world, ticks[index]) };
+                // access it needs. Systems that read the whole world conflict
+                // with each other.
+                unsafe {
+                    run_system(
+                        &mut ***system,
+                        world,
+                        ticks[index],
+                        phase.reads_world[index],
+                    );
+                };
             }));
             let mut progress = lock(&progress);
             match result {
                 Ok(()) => {
-                    progress.finished += 1;
+                    progress.left -= 1;
+                    progress.outcome.finished[index] = true;
                     for &later in &phase.blocks[index] {
                         progress.waits_for[later] -= 1;
                         if progress.waits_for[later] == 0 {
@@ -352,7 +438,7 @@ fn run_parallel(
                     }
                 }
                 Err(payload) => {
-                    progress.panic.get_or_insert(payload);
+                    progress.outcome.panic.get_or_insert(payload);
                 }
             }
             drop(progress);
@@ -368,13 +454,10 @@ fn run_parallel(
         work();
     });
 
-    if let Some(payload) = progress
+    progress
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner)
-        .panic
-    {
-        panic::resume_unwind(payload);
-    }
+        .outcome
 }
 
 /// Locks `mutex`, even if a thread panicked while holding it: the data the
