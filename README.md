@@ -1,9 +1,23 @@
 # petek
 
+[![CI](https://github.com/kadircanyildirm-crypto/petek/actions/workflows/ci.yml/badge.svg)](https://github.com/kadircanyildirm-crypto/petek/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](Cargo.toml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 An archetype-based Entity Component System (ECS) for Rust, built for
 deterministic simulation.
 
-> **Status:** early development, not ready for use yet.
+- **Deterministic:** the same inputs give the same world, bit for bit, on
+  any machine and on any number of threads.
+- **Rollback:** snapshot the world, restore it, and simulate again, as
+  rollback netcode needs.
+- **Checksums:** peers compare a hash of the world to catch desyncs.
+- **Parallel scheduler:** systems run in parallel where their access allows,
+  with the same result as running them one by one.
+- **Sound:** no dependencies, and the whole test suite runs under Miri.
+
+> **Status:** experimental. The API may still change, and the crate is not
+> on crates.io yet.
 
 *Petek* is Turkish for *honeycomb*: entities that have the same set of
 components live side by side in the same cell (an *archetype*), packed densely
@@ -192,7 +206,8 @@ strict standard:
 - [x] Resources, commands and change detection
 - [x] Snapshots, rollback and world checksums
 - [x] Systems and a deterministic parallel scheduler
-- [ ] Events, a rollback demo, benchmarks and derive macros
+- [x] A rollback networking example and benchmarks
+- [ ] Events, system ordering and derive macros
 
 ## License
 
